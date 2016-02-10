@@ -22,14 +22,12 @@ func TestExportImport(t *testing.T) {
 	r, w := io.Pipe()
 	ch := make(chan error)
 	go func() {
-		ch <- buildTarFromFiles(dir, w)
+		w.CloseWithError(buildTarFromFiles(dir, w))
 	}()
-	err = untarSimple(r, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = <-ch
-	if err != nil {
+    go func() {
+        ch <- untarSimple(r, dir)
+    }()
+	if err = <-ch; err != nil {
 		t.Fatal(err)
 	}
 }

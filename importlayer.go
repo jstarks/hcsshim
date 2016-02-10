@@ -2,6 +2,7 @@ package hcsshim
 
 import (
 	"archive/tar"
+    "errors"
 	"io"
 	"io/ioutil"
 	"os"
@@ -49,13 +50,67 @@ func setTimesFromTarHeader(h syscall.Handle, hdr *tar.Header) error {
 	return syscall.SetFileTime(h, &mtime, &atime, &mtime)
 }
 
+type fileLayerWriter struct {
+    currentFile *os.File
+}
+
+func (f *fileLayerWriter) Write(b []byte) (int, error) {
+    if f.currentFile == nil {
+        return 0, errors.New("closed")
+    }
+    return f.currentFile.Write(b)
+}
+
+func (f *fileLayerWriter) Close() error {
+    if f.currentFile != nil {
+        f.currentFile.Close()
+        f.currentFile = nil
+    }
+    return nil
+}
+
+func (f *fileLayerWriter) Next(fi *Win32FileInfo) error {
+    if f.currentFile != nil {
+        f.currentFile.Close()
+        f.currentFile = nil
+    }
+    if fi.Type == TypeFile {
+        pathp, err := syscall.UTF16PtrFromString(fi.Name)
+        if err != nil {
+            return err
+        }
+        h, err := syscall.CreateFile(pathp,
+            syscall.GENERIC_WRITE, syscall.FILE_SHARE_READ, nil,
+            syscall.CREATE_NEW, 0, 0)
+        if err != nil {
+            return err
+        }
+        mtime := syscall.NsecToFiletime(fi.ModTime.UnixNano())
+        atime := syscall.NsecToFiletime(fi.AccessTime.UnixNano())
+        ctime := syscall.NsecToFiletime(fi.CreateTime.UnixNano())
+        err = syscall.SetFileTime(h, &mtime, &atime, &ctime)
+        if err != nil {
+            syscall.Close(h)
+            return err
+        }
+        f.currentFile = os.NewFile(uintptr(h), fi.Name)
+    } else {
+        err := os.Mkdir(fi.Name, 0)
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
 func untarSimple(r io.Reader, root string) error {
 	t := tar.NewReader(r)
+    w := &fileLayerWriter{}
+    defer w.Close()
 	type dirInfo struct {
 		path string
 		hdr  *tar.Header
 	}
-	var dirs []dirInfo
 	for {
 		hdr, err := t.Next()
 		if err == io.EOF {
@@ -66,54 +121,29 @@ func untarSimple(r io.Reader, root string) error {
 		}
 		fi := hdr.FileInfo()
 		if hdr.Name == "." || hdr.Name == ".." {
+            panic(hdr.Name)
 			//panic(fmt.Sprintf("%v", hdr))
 			continue
 		}
+        var typ byte = TypeFile
+        if fi.IsDir() {
+            typ = TypeDirectory
+        }
 		path := filepath.Join(root, hdr.Name)
-		if fi.IsDir() {
-			err = os.Mkdir(path, 0)
-			if err != nil {
-				return err
-			}
-			dirs = append(dirs, dirInfo{path, hdr})
-		} else {
-			pathp, err := syscall.UTF16PtrFromString(path)
-			if err != nil {
-				return err
-			}
-			h, err := syscall.CreateFile(pathp,
-				syscall.GENERIC_WRITE, syscall.FILE_SHARE_READ, nil,
-				syscall.CREATE_NEW, 0, 0)
-			if err != nil {
-				return err
-			}
-			f := os.NewFile(uintptr(h), path)
-			_, err = io.Copy(f, t)
-			f.Close()
-			if err != nil {
-				return err
-			}
-			err = setTimesFromTarHeader(h, hdr)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	for _, d := range dirs {
-		pathp, err := syscall.UTF16PtrFromString(d.path)
-		if err != nil {
-			return err
-		}
-		h, err := syscall.CreateFile(pathp,
-			syscall.GENERIC_WRITE, syscall.FILE_SHARE_READ, nil,
-			syscall.OPEN_EXISTING, syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
-		if err != nil {
-			return err
-		}
-		err = setTimesFromTarHeader(h, d.hdr)
-		syscall.Close(h)
-		if err != nil {
-			return err
+        wfi := &Win32FileInfo {
+            Name: path,
+            Size: 0,
+            Type: typ,
+        }
+        err = w.Next(wfi)
+        if err != nil {
+            return err
+        }
+        if !fi.IsDir() {
+			_, err = io.Copy(w, t)
+            if err != nil {
+                return err
+            }
 		}
 	}
 	return nil
