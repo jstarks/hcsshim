@@ -1,16 +1,144 @@
 package hcsshim
 
 import (
-	"archive/tar"
-    "errors"
+	"errors"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-    "time"
+	"syscall"
+	"time"
 
 	"github.com/Sirupsen/logrus"
 )
+
+var errorIterationCanceled = errors.New("")
+
+type fileEntry struct {
+	f    *os.File
+	path string
+	fi   os.FileInfo
+	err  error
+}
+
+type fileLayerReader struct {
+	root        string
+	result      chan *fileEntry
+	proceed     chan bool
+	closeFunc   func() error
+	currentFile *os.File
+}
+
+func newFileLayerReader(root string, closeFunc func() error) *fileLayerReader {
+	r := &fileLayerReader{
+		root:      root,
+		result:    make(chan *fileEntry),
+		proceed:   make(chan bool),
+		closeFunc: closeFunc,
+	}
+	go r.walk()
+	return r
+}
+
+func (r *fileLayerReader) walk() {
+	defer close(r.result)
+	if !<-r.proceed {
+		return
+	}
+	err := filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == r.root {
+			return nil
+		}
+		var f *os.File
+		if !info.IsDir() {
+			f, err = os.Open(path)
+			if err != nil {
+				return err
+			}
+		}
+		r.result <- &fileEntry{f, path, info, nil}
+		if !<-r.proceed {
+			return errorIterationCanceled
+		}
+		return nil
+	})
+	if err == errorIterationCanceled {
+		return
+	}
+	if err == nil {
+		err = io.EOF
+	}
+	for {
+		r.result <- &fileEntry{err: err}
+		if !<-r.proceed {
+			break
+		}
+	}
+}
+
+func (r *fileLayerReader) Next() (*Win32FileInfo, error) {
+	if r.currentFile != nil {
+		r.currentFile.Close()
+		r.currentFile = nil
+	}
+	r.proceed <- true
+	fe := <-r.result
+	if fe == nil {
+		return nil, errors.New("fileLayerReader closed")
+	}
+	if fe.err != nil {
+		return nil, fe.err
+	}
+	relPath, err := filepath.Rel(r.root, fe.path)
+	if err != nil {
+		fe.f.Close()
+		return nil, err
+	}
+	var typ byte
+	if fe.fi.IsDir() {
+		typ = TypeDirectory
+	} else {
+		typ = TypeFile
+	}
+	fi := &Win32FileInfo{
+		Name:               relPath,
+		Size:               fe.fi.Size(),
+		ModTime:            fe.fi.ModTime(),
+		CreateTime:         fe.fi.ModTime(),
+		Type:               typ,
+		LinkTarget:         "",
+		SecurityDescriptor: "",
+	}
+	if attr, ok := fe.fi.Sys().(*syscall.Win32FileAttributeData); ok {
+		fi.CreateTime = time.Unix(0, attr.CreationTime.Nanoseconds())
+		fi.AccessTime = time.Unix(0, attr.LastAccessTime.Nanoseconds())
+	}
+	r.currentFile = fe.f
+	return fi, nil
+}
+
+func (r *fileLayerReader) Read(b []byte) (int, error) {
+	if r.currentFile == nil {
+		return 0, io.EOF
+	}
+	return r.currentFile.Read(b)
+}
+
+func (r *fileLayerReader) Close() error {
+	r.proceed <- false
+	<-r.result
+	if r.currentFile != nil {
+		r.currentFile.Close()
+		r.currentFile = nil
+	}
+	if r.closeFunc != nil {
+		return r.closeFunc()
+	}
+	return nil
+}
 
 // ExportLayer will create a folder at exportFolderPath and fill that folder with
 // the transport format version of the layer identified by layerId. This transport
@@ -45,188 +173,7 @@ func ExportLayer(info DriverInfo, layerId string, exportFolderPath string, paren
 	return nil
 }
 
-// buildTarFromFiles builds a tar from a set of files.
-// This is intended to be used for TP4; after TP4, Windows should have a proper streaming
-// version of ExportLayer to call.
-func buildTarFromFiles(root string, w io.Writer) error {
-	t := tar.NewWriter(w)
-    r := newFileLayerReader(root, false)
-    defer r.Close()
-    for {
-        fi, err := r.Next()
-        if err == io.EOF {
-            break
-        }
-        if err != nil {
-            return err
-        }
-        hdr := &tar.Header {
-            Name: fi.Name,
-            Size: fi.Size,
-            ModTime: fi.ModTime,
-            AccessTime: fi.AccessTime,
-            ChangeTime: fi.ChangeTime,
-            Linkname: fi.LinkTarget,
-        }
-		err = t.WriteHeader(hdr)
-		if err != nil {
-			return err
-		}
-		if fi.Type == TypeFile {
-			_, err = io.Copy(t, r)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	return t.Close()
-}
-
-const (
-    // Types
-    TypeFile = iota
-    TypeDirectory
-    TypeSymbolicLink
-    TypeDirectorySymbolicLink
-)
-    
-type Win32FileInfo struct {
-    Name string // The file name relative to the layer root
-    Size int64 // The size of the data stream for the file
-    ModTime, AccessTime, CreateTime, ChangeTime time.Time // The various file times
-    Type byte // The type of the file
-    LinkTarget string // The target of symbolic links
-    SecurityDescriptor string // The security descriptor for the file in SDDL format
-}
-
-type LayerReader interface {
-    Next() (*Win32FileInfo, error)
-    io.Reader
-    io.Closer
-}
-
-type LayerWriter interface {
-    Next(*Win32FileInfo) error
-    io.Writer
-    io.Closer
-}
-
-type fileEntry struct {
-    f *os.File
-    path string
-    fi os.FileInfo
-    err error
-}
-
-type fileLayerReader struct {
-    root string
-    result chan *fileEntry
-    proceed chan bool
-    deleteOnClose bool
-    currentFile *os.File
-}
-
-func newFileLayerReader(root string, deleteOnClose bool) *fileLayerReader {
-    r := &fileLayerReader{
-        root: root,
-        result: make(chan *fileEntry),
-        proceed: make(chan bool),
-        deleteOnClose: deleteOnClose,
-    }
-    go r.walk()
-    return r
-}
-
-var errorDone = errors.New("done")
-
-func (r *fileLayerReader) walk() {
-    defer close(r.result)
-    if !<-r.proceed {
-        return
-    }
-	err := filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
-        var f *os.File
-        if err == nil && !info.IsDir() {
-            f, err = os.Open(path)
-        }
-        r.result <- &fileEntry{f, path, info, err}
-        if !<-r.proceed {
-            return errorDone // any error will stop
-        }
-        return err
-	})
-    if err == errorDone {
-        return
-    }
-    for {
-        r.result <- &fileEntry{err: io.EOF}
-        if !<-r.proceed {
-            break
-        }
-    }
-}
-
-func (r *fileLayerReader) Next() (*Win32FileInfo, error) {
-    if r.currentFile != nil {
-        r.currentFile.Close()
-        r.currentFile = nil
-    }
-    r.proceed <- true
-    fe := <-r.result
-    if fe == nil {
-        return nil, errors.New("fileLayerReader closed")
-    }
-    if fe.err != nil {
-        return nil, fe.err
-    }
-    relPath, err := filepath.Rel(r.root, fe.path)
-    if err != nil {
-        fe.f.Close()
-        return nil, err
-    }
-    var typ byte
-    if fe.fi.IsDir() {
-        typ = TypeFile
-    } else {
-        typ = TypeDirectory
-    }
-    fi := &Win32FileInfo{
-        Name: relPath,
-        Size: fe.fi.Size(),
-        ModTime: fe.fi.ModTime(),
-//        AccessTime: fe.fi.AccessTime(),
-        CreateTime: fe.fi.ModTime(), // should look up the change time
-//        ChangeTime: fe.fi.ChangeTime(),
-        Type: typ,
-        LinkTarget: "",
-        SecurityDescriptor: "",
-    }
-    r.currentFile = fe.f
-    return fi, nil
-}
-
-func (r *fileLayerReader) Read(b []byte) (int, error) {
-    if r.currentFile == nil {
-        return 0, io.EOF
-    }
-    return r.currentFile.Read(b)
-}
-
-func (r *fileLayerReader) Close() error {
-    r.proceed <- false
-    <-r.result
-    if r.currentFile != nil {
-        r.currentFile.Close()
-        r.currentFile = nil
-    }
-    if r.deleteOnClose {
-        os.RemoveAll(r.root)
-    }
-    return nil
-}
-
-func ExportLayerAsStream(info DriverInfo, layerId string, parentLayerPaths []string) (LayerReader, error) {
+func GetLayerReader(info DriverInfo, layerId string, parentLayerPaths []string) (LayerReader, error) {
 	dir, err := ioutil.TempDir("", "hcs")
 	if err != nil {
 		return nil, err
@@ -236,5 +183,9 @@ func ExportLayerAsStream(info DriverInfo, layerId string, parentLayerPaths []str
 		os.RemoveAll(dir)
 		return nil, err
 	}
-    return newFileLayerReader(dir, true), nil
+	r := newFileLayerReader(dir, func() error {
+		os.RemoveAll(dir)
+		return nil
+	})
+	return r, nil
 }
