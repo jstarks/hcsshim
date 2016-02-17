@@ -1,95 +1,45 @@
 package hcsshim
 
 import (
-	"errors"
-	"io/ioutil"
-	"os"
-	"path/filepath"
-	"syscall"
+	"runtime"
 
+	"github.com/Microsoft/go-winio"
 	"github.com/Sirupsen/logrus"
 )
 
-type fileLayerWriter struct {
-	root        string
-	closeFunc   func() error
-	currentFile *os.File
+type LayerWriter struct {
+	context uintptr
 }
 
-func newFileLayerWriter(root string, closeFunc func() error) *fileLayerWriter {
-	return &fileLayerWriter{
-		root:      root,
-		closeFunc: closeFunc,
-	}
-}
-
-func (f *fileLayerWriter) Write(b []byte) (int, error) {
-	if f.currentFile == nil {
-		return 0, errors.New("closed")
-	}
-	return f.currentFile.Write(b)
-}
-
-func (f *fileLayerWriter) Close() error {
-	if f.currentFile != nil {
-		f.currentFile.Close()
-		f.currentFile = nil
-	}
-	if f.closeFunc != nil {
-		return f.closeFunc()
+func (w *LayerWriter) Next(name string, fileInfo *winio.FileBasicInfo) error {
+    if name[0] != '\\' {
+        name = `\` + name
+    }
+	err := importLayerNext(w.context, name, fileInfo)
+	if err != nil {
+		return makeError(err, "ImportLayerNext", "")
 	}
 	return nil
 }
 
-func (f *fileLayerWriter) Next(fi *Win32FileInfo) error {
-	if f.currentFile != nil {
-		f.currentFile.Close()
-		f.currentFile = nil
+func (w *LayerWriter) Write(b []byte) (int, error) {
+	err := importLayerWrite(w.context, b)
+	if err != nil {
+		err = makeError(err, "ImportLayerWrite", "")
+		return 0, err
 	}
-	path := filepath.Join(f.root, fi.Name)
-    var attr uint32
-    var createMode uint32
-    closeFile := false
-    switch fi.Type {
-    case TypeFile:
-        createMode = syscall.CREATE_NEW
-    case TypeDirectory:
-        err := os.Mkdir(path, 0)
-        if err != nil {
-            return err
-        }
-        createMode = syscall.OPEN_EXISTING
-        attr |= syscall.FILE_FLAG_BACKUP_SEMANTICS
-        closeFile = true
-    default:
-        // We don't need to support these for the TP4 format.
-        return errors.New("entry not supported")
-    }
-    
-    pathp, err := syscall.UTF16PtrFromString(path)
-    if err != nil {
-        return err
-    }
-    h, err := syscall.CreateFile(pathp,
-        syscall.GENERIC_WRITE, syscall.FILE_SHARE_READ, nil,
-        createMode, attr, 0)
-    if err != nil {
-        return err
-    }
-    mtime := syscall.NsecToFiletime(fi.ModTime.UnixNano())
-    atime := syscall.NsecToFiletime(fi.AccessTime.UnixNano())
-    ctime := syscall.NsecToFiletime(fi.CreateTime.UnixNano())
-    err = syscall.SetFileTime(h, &mtime, &atime, &ctime)
-    if err != nil {
-        syscall.Close(h)
-        return err
-    }
-    if closeFile {
-        syscall.Close(h)
-    } else {
-        f.currentFile = os.NewFile(uintptr(h), path)
-    }
-	return nil
+	return len(b), err
+}
+
+func (w *LayerWriter) Close() (err error) {
+	if w.context != 0 {
+		err = importLayerEnd(w.context)
+		if err != nil {
+			err = makeError(err, "ImportLayerEnd", "")
+		}
+		w.context = 0
+	}
+	return
 }
 
 // ImportLayer will take the contents of the folder at importFolderPath and import
@@ -124,15 +74,24 @@ func ImportLayer(info DriverInfo, layerId string, importFolderPath string, paren
 	return nil
 }
 
-func GetLayerWriter(info DriverInfo, layerId string, parentLayerPaths []string) (LayerWriter, error) {
-	dir, err := ioutil.TempDir("", "hcs")
+func NewLayerWriter(info DriverInfo, layerId string, parentLayerPaths []string) (*LayerWriter, error) {
+	// Generate layer descriptors
+	layers, err := layerPathsToDescriptors(parentLayerPaths)
 	if err != nil {
 		return nil, err
 	}
-	w := newFileLayerWriter(dir, func() error {
-		err := ImportLayer(info, layerId, dir, parentLayerPaths)
-		os.RemoveAll(dir)
-		return err
-	})
+
+	// Convert info to API calling convention
+	infop, err := convertDriverInfo(info)
+	if err != nil {
+		return nil, err
+	}
+
+	w := &LayerWriter{}
+	err = importLayerBegin(&infop, layerId, layers, &w.context)
+	if err != nil {
+		return nil, makeError(err, "ImportLayerStart", "")
+	}
+	runtime.SetFinalizer(w, func(w *LayerWriter) { w.Close() })
 	return w, nil
 }

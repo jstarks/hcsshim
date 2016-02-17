@@ -1,143 +1,63 @@
 package hcsshim
 
 import (
-	"errors"
 	"io"
-	"io/ioutil"
-	"os"
-	"path/filepath"
+	"runtime"
 	"syscall"
-	"time"
 
+	"github.com/Microsoft/go-winio"
 	"github.com/Sirupsen/logrus"
 )
 
-var errorIterationCanceled = errors.New("")
-
-type fileEntry struct {
-	f    *os.File
-	path string
-	fi   os.FileInfo
-	err  error
+type LayerReader struct {
+	context uintptr
 }
 
-type fileLayerReader struct {
-	root        string
-	result      chan *fileEntry
-	proceed     chan bool
-	closeFunc   func() error
-	currentFile *os.File
-}
-
-func newFileLayerReader(root string, closeFunc func() error) *fileLayerReader {
-	r := &fileLayerReader{
-		root:      root,
-		result:    make(chan *fileEntry),
-		proceed:   make(chan bool),
-		closeFunc: closeFunc,
-	}
-	go r.walk()
-	return r
-}
-
-func (r *fileLayerReader) walk() {
-	defer close(r.result)
-	if !<-r.proceed {
-		return
-	}
-	err := filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if path == r.root {
-			return nil
-		}
-		var f *os.File
-		if !info.IsDir() {
-			f, err = os.Open(path)
-			if err != nil {
-				return err
-			}
-		}
-		r.result <- &fileEntry{f, path, info, nil}
-		if !<-r.proceed {
-			return errorIterationCanceled
-		}
-		return nil
-	})
-	if err == errorIterationCanceled {
-		return
-	}
-	if err == nil {
-		err = io.EOF
-	}
-	for {
-		r.result <- &fileEntry{err: err}
-		if !<-r.proceed {
-			break
-		}
-	}
-}
-
-func (r *fileLayerReader) Next() (*Win32FileInfo, error) {
-	if r.currentFile != nil {
-		r.currentFile.Close()
-		r.currentFile = nil
-	}
-	r.proceed <- true
-	fe := <-r.result
-	if fe == nil {
-		return nil, errors.New("fileLayerReader closed")
-	}
-	if fe.err != nil {
-		return nil, fe.err
-	}
-	relPath, err := filepath.Rel(r.root, fe.path)
+func (r *LayerReader) Next() (string, int64, *winio.FileBasicInfo, error) {
+	var fileNamep *uint16
+	fileInfo := &winio.FileBasicInfo{}
+	var deleted uint32
+	var fileSize int64
+	err := exportLayerNext(r.context, &fileNamep, fileInfo, &fileSize, &deleted)
 	if err != nil {
-		fe.f.Close()
-		return nil, err
+		if ensureWin32ErrorCode(err) == syscall.ERROR_NO_MORE_FILES {
+			err = io.EOF
+		} else {
+			err = makeError(err, "ExportLayerNext", "")
+		}
+		return "", 0, nil, err
 	}
-	var typ byte
-	if fe.fi.IsDir() {
-		typ = TypeDirectory
-	} else {
-		typ = TypeFile
+	fileName := convertAndFreeCoTaskMemString(fileNamep)
+	if deleted != 0 {
+		fileInfo = nil
 	}
-	fi := &Win32FileInfo{
-		Name:               relPath,
-		Size:               fe.fi.Size(),
-		ModTime:            fe.fi.ModTime(),
-		CreateTime:         fe.fi.ModTime(),
-		Type:               typ,
-		LinkTarget:         "",
-		SecurityDescriptor: "",
-	}
-	if attr, ok := fe.fi.Sys().(*syscall.Win32FileAttributeData); ok {
-		fi.CreateTime = time.Unix(0, attr.CreationTime.Nanoseconds())
-		fi.AccessTime = time.Unix(0, attr.LastAccessTime.Nanoseconds())
-	}
-	r.currentFile = fe.f
-	return fi, nil
+    if fileName[0] == '\\' {
+        fileName = fileName[1:]
+    }
+	return fileName, fileSize, fileInfo, nil
 }
 
-func (r *fileLayerReader) Read(b []byte) (int, error) {
-	if r.currentFile == nil {
+func (r *LayerReader) Read(b []byte) (int, error) {
+	var bytesRead uint32
+	err := exportLayerRead(r.context, b, &bytesRead)
+	if err != nil {
+		return 0, makeError(err, "ExportLayerRead", "")
+	}
+	if bytesRead == 0 {
 		return 0, io.EOF
 	}
-	return r.currentFile.Read(b)
+	return int(bytesRead), nil
 }
 
-func (r *fileLayerReader) Close() error {
-	r.proceed <- false
-	<-r.result
-	if r.currentFile != nil {
-		r.currentFile.Close()
-		r.currentFile = nil
+func (r *LayerReader) Close() (err error) {
+	if r.context != 0 {
+		err = exportLayerEnd(r.context)
+		if err != nil {
+			err = makeError(err, "ExportLayerEnd", "")
+		}
+		r.context = 0
 	}
-	if r.closeFunc != nil {
-		return r.closeFunc()
-	}
-	return nil
+	return
 }
 
 // ExportLayer will create a folder at exportFolderPath and fill that folder with
@@ -173,19 +93,20 @@ func ExportLayer(info DriverInfo, layerId string, exportFolderPath string, paren
 	return nil
 }
 
-func GetLayerReader(info DriverInfo, layerId string, parentLayerPaths []string) (LayerReader, error) {
-	dir, err := ioutil.TempDir("", "hcs")
+func NewLayerReader(info DriverInfo, layerId string, parentLayerPaths []string) (*LayerReader, error) {
+	layers, err := layerPathsToDescriptors(parentLayerPaths)
 	if err != nil {
 		return nil, err
 	}
-	err = ExportLayer(info, layerId, dir, parentLayerPaths)
+	infop, err := convertDriverInfo(info)
 	if err != nil {
-		os.RemoveAll(dir)
 		return nil, err
 	}
-	r := newFileLayerReader(dir, func() error {
-		os.RemoveAll(dir)
-		return nil
-	})
-	return r, nil
+	r := &LayerReader{}
+	err = exportLayerBegin(&infop, layerId, layers, &r.context)
+	if err != nil {
+		return nil, makeError(err, "ExportLayerBegin", "")
+	}
+	runtime.SetFinalizer(r, func(r *LayerReader) { r.Close() })
+	return r, err
 }
