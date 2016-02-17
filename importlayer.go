@@ -7,41 +7,6 @@ import (
 	"github.com/Sirupsen/logrus"
 )
 
-type LayerWriter struct {
-	context uintptr
-}
-
-func (w *LayerWriter) Next(name string, fileInfo *winio.FileBasicInfo) error {
-    if name[0] != '\\' {
-        name = `\` + name
-    }
-	err := importLayerNext(w.context, name, fileInfo)
-	if err != nil {
-		return makeError(err, "ImportLayerNext", "")
-	}
-	return nil
-}
-
-func (w *LayerWriter) Write(b []byte) (int, error) {
-	err := importLayerWrite(w.context, b)
-	if err != nil {
-		err = makeError(err, "ImportLayerWrite", "")
-		return 0, err
-	}
-	return len(b), err
-}
-
-func (w *LayerWriter) Close() (err error) {
-	if w.context != 0 {
-		err = importLayerEnd(w.context)
-		if err != nil {
-			err = makeError(err, "ImportLayerEnd", "")
-		}
-		w.context = 0
-	}
-	return
-}
-
 // ImportLayer will take the contents of the folder at importFolderPath and import
 // that into a layer with the id layerId.  Note that in order to correctly populate
 // the layer and interperet the transport format, all parent layers must already
@@ -74,6 +39,65 @@ func ImportLayer(info DriverInfo, layerId string, importFolderPath string, paren
 	return nil
 }
 
+// LayerWriter provides an interface to write the contents of a layer to the file system.
+type LayerWriter struct {
+	context uintptr
+}
+
+// Add adds a file or directory to the layer. The file's parent directory must have already been added.
+//
+// name contains the file's relative path. fileInfo contains file times and file attributes; the rest
+// of the file metadata and the file data must be written as a Win32 backup stream to the Write() method.
+// winio.BackupStreamWriter can be used to facilitate this.
+func (w *LayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) error {
+	if name[0] != '\\' {
+		name = `\` + name
+	}
+	err := importLayerNext(w.context, name, fileInfo)
+	if err != nil {
+		return makeError(err, "ImportLayerNext", "")
+	}
+	return nil
+}
+
+// Remove removes a file from the layer. The file must have been present in the parent layer.
+//
+// name contains the file's relative path.
+func (w *LayerWriter) Remove(name string) error {
+	if name[0] != '\\' {
+		name = `\` + name
+	}
+	err := importLayerNext(w.context, name, nil)
+	if err != nil {
+		return makeError(err, "ImportLayerNext", "")
+	}
+	return nil
+}
+
+// Write writes more backup stream data to the current file.
+func (w *LayerWriter) Write(b []byte) (int, error) {
+	err := importLayerWrite(w.context, b)
+	if err != nil {
+		err = makeError(err, "ImportLayerWrite", "")
+		return 0, err
+	}
+	return len(b), err
+}
+
+// Close completes the layer write operation. The error must be checked to ensure that the
+// operation was successful.
+func (w *LayerWriter) Close() (err error) {
+	if w.context != 0 {
+		err = importLayerEnd(w.context)
+		if err != nil {
+			err = makeError(err, "ImportLayerEnd", "")
+		}
+		w.context = 0
+	}
+	return
+}
+
+// NewLayerWriter returns a new layer writer for creating a layer on disk.
 func NewLayerWriter(info DriverInfo, layerId string, parentLayerPaths []string) (*LayerWriter, error) {
 	// Generate layer descriptors
 	layers, err := layerPathsToDescriptors(parentLayerPaths)

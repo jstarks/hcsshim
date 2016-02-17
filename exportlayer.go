@@ -9,57 +9,6 @@ import (
 	"github.com/Sirupsen/logrus"
 )
 
-type LayerReader struct {
-	context uintptr
-}
-
-func (r *LayerReader) Next() (string, int64, *winio.FileBasicInfo, error) {
-	var fileNamep *uint16
-	fileInfo := &winio.FileBasicInfo{}
-	var deleted uint32
-	var fileSize int64
-	err := exportLayerNext(r.context, &fileNamep, fileInfo, &fileSize, &deleted)
-	if err != nil {
-		if ensureWin32ErrorCode(err) == syscall.ERROR_NO_MORE_FILES {
-			err = io.EOF
-		} else {
-			err = makeError(err, "ExportLayerNext", "")
-		}
-		return "", 0, nil, err
-	}
-	fileName := convertAndFreeCoTaskMemString(fileNamep)
-	if deleted != 0 {
-		fileInfo = nil
-	}
-    if fileName[0] == '\\' {
-        fileName = fileName[1:]
-    }
-	return fileName, fileSize, fileInfo, nil
-}
-
-func (r *LayerReader) Read(b []byte) (int, error) {
-	var bytesRead uint32
-	err := exportLayerRead(r.context, b, &bytesRead)
-	if err != nil {
-		return 0, makeError(err, "ExportLayerRead", "")
-	}
-	if bytesRead == 0 {
-		return 0, io.EOF
-	}
-	return int(bytesRead), nil
-}
-
-func (r *LayerReader) Close() (err error) {
-	if r.context != 0 {
-		err = exportLayerEnd(r.context)
-		if err != nil {
-			err = makeError(err, "ExportLayerEnd", "")
-		}
-		r.context = 0
-	}
-	return
-}
-
 // ExportLayer will create a folder at exportFolderPath and fill that folder with
 // the transport format version of the layer identified by layerId. This transport
 // format includes any metadata required for later importing the layer (using
@@ -93,6 +42,68 @@ func ExportLayer(info DriverInfo, layerId string, exportFolderPath string, paren
 	return nil
 }
 
+// LayerReader provides an interface for extracting the contents of an on-disk layer.
+type LayerReader struct {
+	context uintptr
+}
+
+// Next reads the next available file from a layer, ensuring that parent directories are always read
+// before child files and directories.
+//
+// Next returns the file's relative path, size, and basic file metadata. Read() should be used to
+// extract a Win32 backup stream with the remainder of the metadata and the data.
+func (r *LayerReader) Next() (string, int64, *winio.FileBasicInfo, error) {
+	var fileNamep *uint16
+	fileInfo := &winio.FileBasicInfo{}
+	var deleted uint32
+	var fileSize int64
+	err := exportLayerNext(r.context, &fileNamep, fileInfo, &fileSize, &deleted)
+	if err != nil {
+		if err == syscall.ERROR_NO_MORE_FILES {
+			err = io.EOF
+		} else {
+			err = makeError(err, "ExportLayerNext", "")
+		}
+		return "", 0, nil, err
+	}
+	fileName := convertAndFreeCoTaskMemString(fileNamep)
+	if deleted != 0 {
+		fileInfo = nil
+	}
+	if fileName[0] == '\\' {
+		fileName = fileName[1:]
+	}
+	return fileName, fileSize, fileInfo, nil
+}
+
+// Read reads from the current file's Win32 backup stream.
+func (r *LayerReader) Read(b []byte) (int, error) {
+	var bytesRead uint32
+	err := exportLayerRead(r.context, b, &bytesRead)
+	if err != nil {
+		return 0, makeError(err, "ExportLayerRead", "")
+	}
+	if bytesRead == 0 {
+		return 0, io.EOF
+	}
+	return int(bytesRead), nil
+}
+
+// Close frees resources associated with the layer reader. It will return an
+// error if there was an error while reading the layer or of the layer was not
+// completely read.
+func (r *LayerReader) Close() (err error) {
+	if r.context != 0 {
+		err = exportLayerEnd(r.context)
+		if err != nil {
+			err = makeError(err, "ExportLayerEnd", "")
+		}
+		r.context = 0
+	}
+	return
+}
+
+// NewLayerReader returns a new layer reader for reading the contents of an on-disk layer.
 func NewLayerReader(info DriverInfo, layerId string, parentLayerPaths []string) (*LayerReader, error) {
 	layers, err := layerPathsToDescriptors(parentLayerPaths)
 	if err != nil {
