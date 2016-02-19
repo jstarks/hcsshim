@@ -2,16 +2,45 @@ package hcsshim
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/Microsoft/go-winio"
+	"golang.org/x/sys/windows/registry"
 )
 
 var errorIterationCanceled = errors.New("")
+
+func isTP4() bool {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows NT\CurrentVersion`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+
+	s, _, err := k.GetStringValue("BuildLab")
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) < 1 {
+		return false
+	}
+	var val int
+	if val, err = strconv.Atoi(parts[0]); err != nil {
+		return false
+	}
+	if val < 14250 {
+		return true
+	}
+	return false
+}
 
 func openFileOrDir(path string, mode uint32, createDisposition uint32) (file *os.File, err error) {
 	winPath, err := syscall.UTF16FromString(path)
@@ -20,6 +49,7 @@ func openFileOrDir(path string, mode uint32, createDisposition uint32) (file *os
 	}
 	h, err := syscall.CreateFile(&winPath[0], mode, syscall.FILE_SHARE_READ, nil, createDisposition, syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
 	if err != nil {
+		err = &os.PathError{"open", path, err}
 		return
 	}
 	file = os.NewFile(uintptr(h), path)
@@ -38,13 +68,15 @@ type LegacyLayerReader struct {
 	proceed      chan bool
 	currentFile  *os.File
 	backupReader *winio.BackupFileReader
+	isTP4Format  bool
 }
 
 func NewLegacyLayerReader(root string) *LegacyLayerReader {
 	r := &LegacyLayerReader{
-		root:    root,
-		result:  make(chan *fileEntry),
-		proceed: make(chan bool),
+		root:        root,
+		result:      make(chan *fileEntry),
+		proceed:     make(chan bool),
+		isTP4Format: isTP4(),
 	}
 	go r.walk()
 	return r
@@ -57,8 +89,8 @@ func readTombstones(path string) (map[string]([]string), error) {
 	}
 	defer tf.Close()
 	s := bufio.NewScanner(tf)
-	if !s.Scan() || s.Text() != "Version 1.0" {
-		return nil, errors.New("invalid tombstones file")
+	if !s.Scan() || s.Text() != "\xef\xbb\xbfVersion 1.0" {
+		return nil, errors.New("Invalid tombstones file")
 	}
 
 	ts := make(map[string]([]string))
@@ -89,7 +121,7 @@ func (r *LegacyLayerReader) walk() {
 		if err != nil {
 			return err
 		}
-		if path == r.root || path == filepath.Join(r.root, "tombstones.txt") {
+		if path == r.root || path == filepath.Join(r.root, "tombstones.txt") || strings.HasSuffix(path, ".$wcidirs$") {
 			return nil
 		}
 		r.result <- &fileEntry{path, info, nil}
@@ -134,8 +166,26 @@ func (r *LegacyLayerReader) reset() {
 	if r.backupReader != nil {
 		r.backupReader.Close()
 		r.backupReader = nil
+	}
+	if r.currentFile != nil {
 		r.currentFile.Close()
 		r.currentFile = nil
+	}
+}
+
+func findBackupStreamSize(r io.Reader) (int64, error) {
+	br := winio.NewBackupStreamReader(r)
+	for {
+		hdr, err := br.Next()
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return 0, err
+		}
+		if hdr.Id == winio.BackupData {
+			return hdr.Size, nil
+		}
 	}
 }
 
@@ -162,8 +212,11 @@ func (r *LegacyLayerReader) Next() (path string, size int64, fileInfo *winio.Fil
 		return
 	}
 
-	size = fe.fi.Size()
-	f, err := openFileOrDir(fe.path, syscall.GENERIC_READ, 0)
+	if fe.fi.IsDir() && strings.HasPrefix(path, `Files\`) {
+		fe.path += ".$wcidirs$"
+	}
+
+	f, err := openFileOrDir(fe.path, syscall.GENERIC_READ, syscall.OPEN_EXISTING)
 	if err != nil {
 		return
 	}
@@ -178,15 +231,49 @@ func (r *LegacyLayerReader) Next() (path string, size int64, fileInfo *winio.Fil
 		return
 	}
 
+	if !strings.HasPrefix(path, `Files\`) {
+		size = fe.fi.Size()
+		r.backupReader = winio.NewBackupFileReader(f, false)
+	} else {
+		beginning := int64(0)
+		if !r.isTP4Format {
+			// In TP5, the file attributes were added before the backup stream
+			var attr uint32
+			err = binary.Read(f, binary.LittleEndian, &attr)
+			if err != nil {
+				return
+			}
+			fileInfo.FileAttributes = uintptr(attr)
+			beginning = 4
+		}
+
+		// Find the accurate file size.
+		if !fe.fi.IsDir() {
+			size, err = findBackupStreamSize(f)
+			if err != nil {
+				err = &os.PathError{"findBackupStreamSize", fe.path, err}
+				return
+			}
+		}
+
+		// Return back to the beginning of the backup stream.
+		_, err = f.Seek(beginning, 0)
+		if err != nil {
+			return
+		}
+	}
+
 	r.currentFile = f
-	r.backupReader = winio.NewBackupFileReader(f, false)
 	f = nil
 	return
 }
 
 func (r *LegacyLayerReader) Read(b []byte) (int, error) {
 	if r.backupReader == nil {
-		return 0, io.EOF
+		if r.currentFile == nil {
+			return 0, io.EOF
+		}
+		return r.currentFile.Read(b)
 	}
 	return r.backupReader.Read(b)
 }
@@ -203,11 +290,13 @@ type LegacyLayerWriter struct {
 	currentFile  *os.File
 	backupWriter *winio.BackupFileWriter
 	tombstones   []string
+	isTP4Format  bool
 }
 
 func NewLegacyLayerWriter(root string) *LegacyLayerWriter {
 	return &LegacyLayerWriter{
-		root: root,
+		root:        root,
+		isTP4Format: isTP4(),
 	}
 }
 
@@ -215,6 +304,8 @@ func (w *LegacyLayerWriter) reset() {
 	if w.backupWriter != nil {
 		w.backupWriter.Close()
 		w.backupWriter = nil
+	}
+	if w.currentFile != nil {
 		w.currentFile.Close()
 		w.currentFile = nil
 	}
@@ -230,7 +321,11 @@ func (w *LegacyLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) erro
 		if err != nil {
 			return err
 		}
-		createDisposition = syscall.OPEN_EXISTING
+		if strings.HasPrefix(name, `Files\`) {
+			path += ".$wcidirs$"
+		} else {
+			createDisposition = syscall.OPEN_EXISTING
+		}
 	}
 
 	f, err := openFileOrDir(path, syscall.GENERIC_READ|syscall.GENERIC_WRITE, createDisposition)
@@ -244,13 +339,26 @@ func (w *LegacyLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) erro
 		}
 	}()
 
-	err = winio.SetFileBasicInfo(f, fileInfo)
+	strippedFi := *fileInfo
+	strippedFi.FileAttributes = 0
+	err = winio.SetFileBasicInfo(f, &strippedFi)
 	if err != nil {
 		return err
 	}
 
+	if !strings.HasPrefix(name, `Files\`) {
+		w.backupWriter = winio.NewBackupFileWriter(f, false)
+	} else {
+		if !w.isTP4Format {
+			// In TP5, the file attributes were added to the header
+			err = binary.Write(f, binary.LittleEndian, uint32(fileInfo.FileAttributes))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	w.currentFile = f
-	w.backupWriter = winio.NewBackupFileWriter(f, false)
 	f = nil
 	return nil
 }
@@ -262,7 +370,10 @@ func (w *LegacyLayerWriter) Remove(name string) error {
 
 func (w *LegacyLayerWriter) Write(b []byte) (int, error) {
 	if w.backupWriter == nil {
-		return 0, errors.New("closed")
+		if w.currentFile == nil {
+			return 0, errors.New("closed")
+		}
+		return w.currentFile.Write(b)
 	}
 	return w.backupWriter.Write(b)
 }
@@ -274,7 +385,7 @@ func (w *LegacyLayerWriter) Close() error {
 		return err
 	}
 	defer tf.Close()
-	_, err = tf.Write([]byte("Version 1.0\n"))
+	_, err = tf.Write([]byte("\xef\xbb\xbfVersion 1.0\n"))
 	if err != nil {
 		return err
 	}
