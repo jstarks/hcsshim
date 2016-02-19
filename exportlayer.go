@@ -42,8 +42,14 @@ func ExportLayer(info DriverInfo, layerId string, exportFolderPath string, paren
 	return nil
 }
 
-// LayerReader provides an interface for extracting the contents of an on-disk layer.
-type LayerReader struct {
+type LayerReader interface {
+	Next() (string, int64, *winio.FileBasicInfo, error)
+	Read(b []byte) (int, error)
+	Close() error
+}
+
+// FilterLayerReader provides an interface for extracting the contents of an on-disk layer.
+type FilterLayerReader struct {
 	context uintptr
 }
 
@@ -52,7 +58,7 @@ type LayerReader struct {
 //
 // Next returns the file's relative path, size, and basic file metadata. Read() should be used to
 // extract a Win32 backup stream with the remainder of the metadata and the data.
-func (r *LayerReader) Next() (string, int64, *winio.FileBasicInfo, error) {
+func (r *FilterLayerReader) Next() (string, int64, *winio.FileBasicInfo, error) {
 	var fileNamep *uint16
 	fileInfo := &winio.FileBasicInfo{}
 	var deleted uint32
@@ -77,7 +83,7 @@ func (r *LayerReader) Next() (string, int64, *winio.FileBasicInfo, error) {
 }
 
 // Read reads from the current file's Win32 backup stream.
-func (r *LayerReader) Read(b []byte) (int, error) {
+func (r *FilterLayerReader) Read(b []byte) (int, error) {
 	var bytesRead uint32
 	err := exportLayerRead(r.context, b, &bytesRead)
 	if err != nil {
@@ -92,7 +98,7 @@ func (r *LayerReader) Read(b []byte) (int, error) {
 // Close frees resources associated with the layer reader. It will return an
 // error if there was an error while reading the layer or of the layer was not
 // completely read.
-func (r *LayerReader) Close() (err error) {
+func (r *FilterLayerReader) Close() (err error) {
 	if r.context != 0 {
 		err = exportLayerEnd(r.context)
 		if err != nil {
@@ -104,7 +110,7 @@ func (r *LayerReader) Close() (err error) {
 }
 
 // NewLayerReader returns a new layer reader for reading the contents of an on-disk layer.
-func NewLayerReader(info DriverInfo, layerId string, parentLayerPaths []string) (*LayerReader, error) {
+func NewLayerReader(info DriverInfo, layerId string, parentLayerPaths []string) (*FilterLayerReader, error) {
 	layers, err := layerPathsToDescriptors(parentLayerPaths)
 	if err != nil {
 		return nil, err
@@ -113,11 +119,11 @@ func NewLayerReader(info DriverInfo, layerId string, parentLayerPaths []string) 
 	if err != nil {
 		return nil, err
 	}
-	r := &LayerReader{}
+	r := &FilterLayerReader{}
 	err = exportLayerBegin(&infop, layerId, layers, &r.context)
 	if err != nil {
 		return nil, makeError(err, "ExportLayerBegin", "")
 	}
-	runtime.SetFinalizer(r, func(r *LayerReader) { r.Close() })
+	runtime.SetFinalizer(r, func(r *FilterLayerReader) { r.Close() })
 	return r, err
 }

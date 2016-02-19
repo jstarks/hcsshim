@@ -39,8 +39,15 @@ func ImportLayer(info DriverInfo, layerId string, importFolderPath string, paren
 	return nil
 }
 
-// LayerWriter provides an interface to write the contents of a layer to the file system.
-type LayerWriter struct {
+type LayerWriter interface {
+	Add(name string, fileInfo *winio.FileBasicInfo) error
+	Remove(name string) error
+	Write(b []byte) (int, error)
+	Close() error
+}
+
+// FilterLayerWriter provides an interface to write the contents of a layer to the file system.
+type FilterLayerWriter struct {
 	context uintptr
 }
 
@@ -49,7 +56,7 @@ type LayerWriter struct {
 // name contains the file's relative path. fileInfo contains file times and file attributes; the rest
 // of the file metadata and the file data must be written as a Win32 backup stream to the Write() method.
 // winio.BackupStreamWriter can be used to facilitate this.
-func (w *LayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) error {
+func (w *FilterLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) error {
 	if name[0] != '\\' {
 		name = `\` + name
 	}
@@ -63,7 +70,7 @@ func (w *LayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) error {
 // Remove removes a file from the layer. The file must have been present in the parent layer.
 //
 // name contains the file's relative path.
-func (w *LayerWriter) Remove(name string) error {
+func (w *FilterLayerWriter) Remove(name string) error {
 	if name[0] != '\\' {
 		name = `\` + name
 	}
@@ -75,7 +82,7 @@ func (w *LayerWriter) Remove(name string) error {
 }
 
 // Write writes more backup stream data to the current file.
-func (w *LayerWriter) Write(b []byte) (int, error) {
+func (w *FilterLayerWriter) Write(b []byte) (int, error) {
 	err := importLayerWrite(w.context, b)
 	if err != nil {
 		err = makeError(err, "ImportLayerWrite", "")
@@ -86,7 +93,7 @@ func (w *LayerWriter) Write(b []byte) (int, error) {
 
 // Close completes the layer write operation. The error must be checked to ensure that the
 // operation was successful.
-func (w *LayerWriter) Close() (err error) {
+func (w *FilterLayerWriter) Close() (err error) {
 	if w.context != 0 {
 		err = importLayerEnd(w.context)
 		if err != nil {
@@ -98,7 +105,7 @@ func (w *LayerWriter) Close() (err error) {
 }
 
 // NewLayerWriter returns a new layer writer for creating a layer on disk.
-func NewLayerWriter(info DriverInfo, layerId string, parentLayerPaths []string) (*LayerWriter, error) {
+func NewLayerWriter(info DriverInfo, layerId string, parentLayerPaths []string) (*FilterLayerWriter, error) {
 	// Generate layer descriptors
 	layers, err := layerPathsToDescriptors(parentLayerPaths)
 	if err != nil {
@@ -111,11 +118,11 @@ func NewLayerWriter(info DriverInfo, layerId string, parentLayerPaths []string) 
 		return nil, err
 	}
 
-	w := &LayerWriter{}
+	w := &FilterLayerWriter{}
 	err = importLayerBegin(&infop, layerId, layers, &w.context)
 	if err != nil {
 		return nil, makeError(err, "ImportLayerStart", "")
 	}
-	runtime.SetFinalizer(w, func(w *LayerWriter) { w.Close() })
+	runtime.SetFinalizer(w, func(w *FilterLayerWriter) { w.Close() })
 	return w, nil
 }
