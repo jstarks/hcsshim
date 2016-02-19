@@ -99,10 +99,10 @@ func (r *LegacyLayerReader) walk() {
 
 		// List all the tombstones.
 		if info.IsDir() {
-            relPath, err := filepath.Rel(r.root, path)
-            if err != nil {
-                return err
-            }
+			relPath, err := filepath.Rel(r.root, path)
+			if err != nil {
+				return err
+			}
 			if dts, ok := ts[relPath]; ok {
 				for _, t := range dts {
 					r.result <- &fileEntry{t, nil, nil}
@@ -157,30 +157,30 @@ func (r *LegacyLayerReader) Next() (path string, size int64, fileInfo *winio.Fil
 		return
 	}
 
-    if fe.fi == nil {
-        // This is a tombstone. Return a nil fileInfo.
-        return
-    }
+	if fe.fi == nil {
+		// This is a tombstone. Return a nil fileInfo.
+		return
+	}
 
-    size = fe.fi.Size()
-    f, err := openFileOrDir(fe.path, syscall.GENERIC_READ, 0)
-    if err != nil {
-        return
-    }
-    defer func() {
-        if f != nil {
-            f.Close()
-        }
-    }()
+	size = fe.fi.Size()
+	f, err := openFileOrDir(fe.path, syscall.GENERIC_READ, 0)
+	if err != nil {
+		return
+	}
+	defer func() {
+		if f != nil {
+			f.Close()
+		}
+	}()
 
-    fileInfo, err = winio.GetFileBasicInfo(f)
-    if err != nil {
-        return
-    }
+	fileInfo, err = winio.GetFileBasicInfo(f)
+	if err != nil {
+		return
+	}
 
-    r.currentFile = f
-    r.backupReader = winio.NewBackupFileReader(f, false)
-    f = nil
+	r.currentFile = f
+	r.backupReader = winio.NewBackupFileReader(f, false)
+	f = nil
 	return
 }
 

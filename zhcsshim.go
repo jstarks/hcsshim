@@ -388,8 +388,8 @@ func _importLayerBegin(info *driverInfo, id *uint16, descriptors []WC_LAYER_DESC
 		return
 	}
 	r0, _, _ := syscall.Syscall6(procImportLayerBegin.Addr(), 5, uintptr(unsafe.Pointer(info)), uintptr(unsafe.Pointer(id)), uintptr(unsafe.Pointer(_p1)), uintptr(len(descriptors)), uintptr(unsafe.Pointer(context)), 0)
-	if r0 != 0 {
-		hr = syscall.Errno(r0)
+	if int32(r0) < 0 {
+		hr = syscall.Errno(win32FromHresult(r0))
 	}
 	return
 }
@@ -408,8 +408,8 @@ func _importLayerNext(context uintptr, fileName *uint16, fileInfo *winio.FileBas
 		return
 	}
 	r0, _, _ := syscall.Syscall(procImportLayerNext.Addr(), 3, uintptr(context), uintptr(unsafe.Pointer(fileName)), uintptr(unsafe.Pointer(fileInfo)))
-	if r0 != 0 {
-		hr = syscall.Errno(r0)
+	if int32(r0) < 0 {
+		hr = syscall.Errno(win32FromHresult(r0))
 	}
 	return
 }
@@ -423,8 +423,8 @@ func importLayerWrite(context uintptr, buffer []byte) (hr error) {
 		return
 	}
 	r0, _, _ := syscall.Syscall(procImportLayerWrite.Addr(), 3, uintptr(context), uintptr(unsafe.Pointer(_p0)), uintptr(len(buffer)))
-	if r0 != 0 {
-		hr = syscall.Errno(r0)
+	if int32(r0) < 0 {
+		hr = syscall.Errno(win32FromHresult(r0))
 	}
 	return
 }
@@ -434,8 +434,8 @@ func importLayerEnd(context uintptr) (hr error) {
 		return
 	}
 	r0, _, _ := syscall.Syscall(procImportLayerEnd.Addr(), 1, uintptr(context), 0, 0)
-	if r0 != 0 {
-		hr = syscall.Errno(r0)
+	if int32(r0) < 0 {
+		hr = syscall.Errno(win32FromHresult(r0))
 	}
 	return
 }
@@ -458,8 +458,8 @@ func _exportLayerBegin(info *driverInfo, id *uint16, descriptors []WC_LAYER_DESC
 		return
 	}
 	r0, _, _ := syscall.Syscall6(procExportLayerBegin.Addr(), 5, uintptr(unsafe.Pointer(info)), uintptr(unsafe.Pointer(id)), uintptr(unsafe.Pointer(_p1)), uintptr(len(descriptors)), uintptr(unsafe.Pointer(context)), 0)
-	if r0 != 0 {
-		hr = syscall.Errno(r0)
+	if int32(r0) < 0 {
+		hr = syscall.Errno(win32FromHresult(r0))
 	}
 	return
 }
@@ -469,8 +469,8 @@ func exportLayerNext(context uintptr, fileName **uint16, fileInfo *winio.FileBas
 		return
 	}
 	r0, _, _ := syscall.Syscall6(procExportLayerNext.Addr(), 5, uintptr(context), uintptr(unsafe.Pointer(fileName)), uintptr(unsafe.Pointer(fileInfo)), uintptr(unsafe.Pointer(fileSize)), uintptr(unsafe.Pointer(deleted)), 0)
-	if r0 != 0 {
-		hr = syscall.Errno(r0)
+	if int32(r0) < 0 {
+		hr = syscall.Errno(win32FromHresult(r0))
 	}
 	return
 }
@@ -484,8 +484,8 @@ func exportLayerRead(context uintptr, buffer []byte, bytesRead *uint32) (hr erro
 		return
 	}
 	r0, _, _ := syscall.Syscall6(procExportLayerRead.Addr(), 4, uintptr(context), uintptr(unsafe.Pointer(_p0)), uintptr(len(buffer)), uintptr(unsafe.Pointer(bytesRead)), 0, 0)
-	if r0 != 0 {
-		hr = syscall.Errno(r0)
+	if int32(r0) < 0 {
+		hr = syscall.Errno(win32FromHresult(r0))
 	}
 	return
 }
@@ -495,8 +495,8 @@ func exportLayerEnd(context uintptr) (hr error) {
 		return
 	}
 	r0, _, _ := syscall.Syscall(procExportLayerEnd.Addr(), 1, uintptr(context), 0, 0)
-	if r0 != 0 {
-		hr = syscall.Errno(r0)
+	if int32(r0) < 0 {
+		hr = syscall.Errno(win32FromHresult(r0))
 	}
 	return
 }
