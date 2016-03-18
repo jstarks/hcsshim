@@ -12,6 +12,9 @@ type ProcessConfig struct{}
 // CreateContainer creates a new container with the given configuration but does not start it.
 func CreateContainer(id string, c *ContainerConfig) (Container, error)
 
+// OpenContainer opens an existing container by ID.
+func OpenContainer(id string) (Container, error)
+
 // Container represents a created (but not necessarily running) container.
 type Container interface {
 	// Start synchronously starts the container.
