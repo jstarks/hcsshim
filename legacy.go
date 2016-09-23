@@ -49,17 +49,15 @@ type legacyLayerReader struct {
 	proceed      chan bool
 	currentFile  *os.File
 	backupReader *winio.BackupFileReader
-	isTP4Format  bool
 }
 
 // newLegacyLayerReader returns a new LayerReader that can read the Windows
-// TP4 transport format from disk.
+// container layer transport format from disk.
 func newLegacyLayerReader(root string) *legacyLayerReader {
 	r := &legacyLayerReader{
-		root:        root,
-		result:      make(chan *fileEntry),
-		proceed:     make(chan bool),
-		isTP4Format: IsTP4(),
+		root:    root,
+		result:  make(chan *fileEntry),
+		proceed: make(chan bool),
 	}
 	go r.walk()
 	return r
@@ -251,17 +249,14 @@ func (r *legacyLayerReader) Next() (path string, size int64, fileInfo *winio.Fil
 		fileInfo.LastAccessTime = fileInfo.LastWriteTime
 
 	} else {
-		beginning := int64(0)
-		if !r.isTP4Format {
-			// In TP5, the file attributes were added before the backup stream
-			var attr uint32
-			err = binary.Read(f, binary.LittleEndian, &attr)
-			if err != nil {
-				return
-			}
-			fileInfo.FileAttributes = uintptr(attr)
-			beginning = 4
+		// The file attributes are written before the backup stream.
+		var attr uint32
+		err = binary.Read(f, binary.LittleEndian, &attr)
+		if err != nil {
+			return
 		}
+		fileInfo.FileAttributes = uintptr(attr)
+		beginning := int64(4)
 
 		// Find the accurate file size.
 		if !fe.fi.IsDir() {
@@ -303,19 +298,20 @@ func (r *legacyLayerReader) Close() error {
 
 type legacyLayerWriter struct {
 	root         string
+	parentRoot   string
 	currentFile  *os.File
 	backupWriter *winio.BackupFileWriter
 	tombstones   []string
-	isTP4Format  bool
 	pathFixed    bool
+	HasUtilityVM bool
 }
 
-// newLegacyLayerWriter returns a LayerWriter that can write the TP4 transport format
-// to disk.
-func newLegacyLayerWriter(root string) *legacyLayerWriter {
+// newLegacyLayerWriter returns a LayerWriter that can write the contaler layer
+// transport format to disk.
+func newLegacyLayerWriter(root string, parentRoot string) *legacyLayerWriter {
 	return &legacyLayerWriter{
-		root:        root,
-		isTP4Format: IsTP4(),
+		root:       root,
+		parentRoot: parentRoot,
 	}
 }
 
@@ -325,8 +321,28 @@ func (w *legacyLayerWriter) init() error {
 		if err != nil {
 			return err
 		}
+		parentPath, err := makeLongAbsPath(w.parentRoot)
+		if err != nil {
+			return err
+		}
 		w.root = path
+		w.parentRoot = parentPath
 		w.pathFixed = true
+	}
+	return nil
+}
+
+func (w *legacyLayerWriter) initUtilityVM() error {
+	if !w.HasUtilityVM {
+		// Server 2016 does not support multiple layers for the utility VM, so
+		// clone the utility VM from the parent layer into this layer. Use hard
+		// links to avoid unnecessary copying, since most of the files are immutable.
+		err := cloneTree(filepath.Join(w.parentRoot, `UtilityVM\Files`), filepath.Join(w.root, `UtilityVM\Files`))
+		if err != nil {
+			return err
+		}
+		// TODO de-hardlinkify BCD and BCD.LOG
+		w.HasUtilityVM = true
 	}
 	return nil
 }
@@ -342,15 +358,78 @@ func (w *legacyLayerWriter) reset() {
 	}
 }
 
+// cloneTree clones a directory tree using hard links
+func cloneTree(sourcePath, destPath string) error {
+	// BUGBUG: this walk won't grab files that are ACLed tightly, I think
+	return filepath.Walk(sourcePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(sourcePath, path)
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			// BUGBUG Need to mirror SD and other metadata
+			err = os.Mkdir(filepath.Join(destPath, relPath), 0)
+			if err != nil {
+				return err
+			}
+		} else {
+			err = os.Link(path, filepath.Join(destPath, relPath))
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+}
+
 func (w *legacyLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) error {
 	w.reset()
 	err := w.init()
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(w.root, name)
 
-	createDisposition := uint32(syscall.CREATE_NEW)
+	path := filepath.Join(w.root, name)
+	if strings.HasPrefix(name, `UtilityVM\`) {
+		err = w.initUtilityVM()
+		if err != nil {
+			return err
+		}
+
+		createDisposition := uint32(syscall.OPEN_EXISTING)
+		if (fileInfo.FileAttributes & syscall.FILE_ATTRIBUTE_DIRECTORY) == 0 {
+			// Remove the previous hard link, if present.
+			err = os.Remove(path)
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+
+			createDisposition = syscall.CREATE_NEW
+		}
+
+		f, err := openFileOrDir(path, syscall.GENERIC_READ|syscall.GENERIC_WRITE|winio.WRITE_DAC|winio.WRITE_OWNER|winio.ACCESS_SYSTEM_SECURITY, createDisposition)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if f != nil {
+				f.Close()
+				os.Remove(path)
+			}
+		}()
+
+		w.backupWriter = winio.NewBackupFileWriter(f, true)
+		w.currentFile = f
+		f = nil
+		return nil
+	}
+
 	if (fileInfo.FileAttributes & syscall.FILE_ATTRIBUTE_DIRECTORY) != 0 {
 		err := os.Mkdir(path, 0)
 		if err != nil {
@@ -359,7 +438,7 @@ func (w *legacyLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) erro
 		path += ".$wcidirs$"
 	}
 
-	f, err := openFileOrDir(path, syscall.GENERIC_READ|syscall.GENERIC_WRITE, createDisposition)
+	f, err := openFileOrDir(path, syscall.GENERIC_READ|syscall.GENERIC_WRITE, syscall.CREATE_NEW)
 	if err != nil {
 		return err
 	}
@@ -380,12 +459,10 @@ func (w *legacyLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) erro
 	if strings.HasPrefix(name, `Hives\`) {
 		w.backupWriter = winio.NewBackupFileWriter(f, false)
 	} else {
-		if !w.isTP4Format {
-			// In TP5, the file attributes were added to the header
-			err = binary.Write(f, binary.LittleEndian, uint32(fileInfo.FileAttributes))
-			if err != nil {
-				return err
-			}
+		// The file attributes are written before the stream.
+		err = binary.Write(f, binary.LittleEndian, uint32(fileInfo.FileAttributes))
+		if err != nil {
+			return err
 		}
 	}
 
@@ -399,10 +476,21 @@ func (w *legacyLayerWriter) AddLink(name string, target string) error {
 }
 
 func (w *legacyLayerWriter) Remove(name string) error {
-	if !strings.HasPrefix(name, `Files\`) {
+	if strings.HasPrefix(name, `Files\`) {
+		w.tombstones = append(w.tombstones, name[len(`Files\`):])
+	} else if strings.HasPrefix(name, `UtilityVM\`) {
+		err := w.initUtilityVM()
+		if err != nil {
+			return err
+		}
+		err = os.Remove(filepath.Join(w.root, name))
+		if err != nil {
+			return err
+		}
+	} else {
 		return fmt.Errorf("invalid tombstone %s", name)
 	}
-	w.tombstones = append(w.tombstones, name[len(`Files\`):])
+
 	return nil
 }
 
