@@ -143,10 +143,7 @@ func (r *legacyLayerWriterWrapper) Close() error {
 			err = ImportLayer(info, fullPath, r.path, r.parentLayerPaths)
 			// Prepare the utility VM for use if one is present in the layer.
 			if err == nil && r.legacyLayerWriter.HasUtilityVM {
-				err = ProcessUtilityVMImage(filepath.Join(r.path, "UtilityVM"))
-				if err != nil {
-					return err
-				}
+				err = ProcessUtilityVMImage(filepath.Join(fullPath, "UtilityVM"))
 			}
 		}
 	}
@@ -173,7 +170,7 @@ func NewLayerWriter(info DriverInfo, layerID string, parentLayerPaths []string) 
 			return nil, err
 		}
 		return &legacyLayerWriterWrapper{
-			legacyLayerWriter: newLegacyLayerWriter(path, parentLayerPaths[0]),
+			legacyLayerWriter: newLegacyLayerWriter(path, parentLayerPaths[0], filepath.Join(info.HomeDir, layerID)),
 			info:              info,
 			layerID:           layerID,
 			path:              path,
