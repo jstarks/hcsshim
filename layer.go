@@ -1,8 +1,10 @@
 package hcsshim
 
 import (
+	"errors"
 	"path/filepath"
 
+	winio "github.com/Microsoft/go-winio"
 	"github.com/Microsoft/hcsshim/internal/wclayer"
 )
 
@@ -61,8 +63,65 @@ type DriverInfo struct {
 	HomeDir string
 }
 
-type FilterLayerReader = wclayer.FilterLayerReader
-type FilterLayerWriter = wclayer.FilterLayerWriter
+// FilterLayerReader provides an interface for extracting the contents of an on-disk layer.
+type FilterLayerReader struct{}
+
+// Next reads the next available file from a layer, ensuring that parent directories are always read
+// before child files and directories.
+//
+// Next returns the file's relative path, size, and basic file metadata. Read() should be used to
+// extract a Win32 backup stream with the remainder of the metadata and the data.
+func (r *FilterLayerReader) Next() (string, int64, *winio.FileBasicInfo, error) {
+	return "", 0, nil, errors.New("not implemented")
+}
+
+// Read reads from the current file's Win32 backup stream.
+func (r *FilterLayerReader) Read(b []byte) (int, error) {
+	return 0, errors.New("not implemented")
+}
+
+// Close frees resources associated with the layer reader. It will return an
+// error if there was an error while reading the layer or of the layer was not
+// completely read.
+func (r *FilterLayerReader) Close() (err error) {
+	return errors.New("not implemented")
+}
+
+// FilterLayerWriter provides an interface to write the contents of a layer to the file system.
+type FilterLayerWriter struct{}
+
+// Add adds a file or directory to the layer. The file's parent directory must have already been added.
+//
+// name contains the file's relative path. fileInfo contains file times and file attributes; the rest
+// of the file metadata and the file data must be written as a Win32 backup stream to the Write() method.
+// winio.BackupStreamWriter can be used to facilitate this.
+func (w *FilterLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) error {
+	return errors.New("not supported")
+}
+
+// AddLink adds a hard link to the layer. The target of the link must have already been added.
+func (w *FilterLayerWriter) AddLink(name string, target string) error {
+	return errors.New("not supported")
+}
+
+// Remove removes a file from the layer. The file must have been present in the parent layer.
+//
+// name contains the file's relative path.
+func (w *FilterLayerWriter) Remove(name string) error {
+	return errors.New("not supported")
+}
+
+// Write writes more backup stream data to the current file.
+func (w *FilterLayerWriter) Write(b []byte) (int, error) {
+	return 0, errors.New("not supported")
+}
+
+// Close completes the layer write operation. The error must be checked to ensure that the
+// operation was successful.
+func (w *FilterLayerWriter) Close() (err error) {
+	return errors.New("not supported")
+}
+
 type GUID = wclayer.GUID
 
 func NameToGuid(name string) (id GUID, err error) {
