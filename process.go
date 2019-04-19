@@ -1,6 +1,7 @@
 package hcsshim
 
 import (
+	"context"
 	"io"
 	"time"
 
@@ -19,12 +20,19 @@ func (process *process) Pid() int {
 
 // Kill signals the process to terminate but does not wait for it to finish terminating.
 func (process *process) Kill() error {
-	return convertProcessError(process.p.Kill(), process)
+	found, err := process.p.Kill()
+	if err != nil {
+		return convertProcessError(err, process)
+	}
+	if !found {
+		return &ProcessError{Process: process, Err: ErrElementNotFound, Operation: "hcsshim::Process::Kill"}
+	}
+	return nil
 }
 
 // Wait waits for the process to exit.
 func (process *process) Wait() error {
-	return convertProcessError(process.p.Wait(), process)
+	return convertProcessError(process.p.Wait(context.Background()), process)
 }
 
 // WaitTimeout waits for the process to exit or the duration to elapse. It returns

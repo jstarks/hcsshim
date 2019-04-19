@@ -1,6 +1,7 @@
 package hcsshim
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
@@ -99,17 +100,31 @@ func (container *container) Start() error {
 
 // Shutdown requests a container shutdown, but it may not actually be shutdown until Wait() succeeds.
 func (container *container) Shutdown() error {
-	return convertSystemError(container.system.Shutdown(), container)
+	delivered, err := container.system.Shutdown()
+	if err != nil {
+		return convertSystemError(err, container)
+	}
+	if delivered {
+		return &ContainerError{Container: container, Err: ErrVmcomputeOperationPending, Operation: "hcsshim::ComputeSystem::Shutdown"}
+	}
+	return nil
 }
 
 // Terminate requests a container terminate, but it may not actually be terminated until Wait() succeeds.
 func (container *container) Terminate() error {
-	return convertSystemError(container.system.Terminate(), container)
+	delivered, err := container.system.Terminate()
+	if err != nil {
+		return convertSystemError(err, container)
+	}
+	if delivered {
+		return &ContainerError{Container: container, Err: ErrVmcomputeOperationPending, Operation: "hcsshim::ComputeSystem::Shutdown"}
+	}
+	return nil
 }
 
 // Waits synchronously waits for the container to shutdown or terminate.
 func (container *container) Wait() error {
-	return convertSystemError(container.system.Wait(), container)
+	return convertSystemError(container.system.Wait(context.Background()), container)
 }
 
 // WaitTimeout synchronously waits for the container to terminate or the duration to elapse. It

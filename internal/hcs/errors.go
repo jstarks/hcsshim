@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"syscall"
 
 	"github.com/Microsoft/hcsshim/internal/interop"
@@ -242,6 +243,9 @@ func IsPending(err error) bool {
 // IsTimeout returns a boolean indicating whether the error is caused by
 // a timeout waiting for the operation to complete.
 func IsTimeout(err error) bool {
+	if err, ok := err.(net.Error); ok && err.Timeout() {
+		return true
+	}
 	err = getInnerError(err)
 	return err == ErrTimeout
 }

@@ -519,39 +519,39 @@ func (ht *hcsTask) close() {
 		// testing.
 		if ht.c != nil {
 			// Do our best attempt to tear down the container.
-			if err := ht.c.Shutdown(); err != nil {
-				if hcs.IsAlreadyClosed(err) || hcs.IsNotExist(err) || hcs.IsAlreadyStopped(err) {
-					// This is the state we want. Do nothing.
-				} else if !hcs.IsPending(err) {
+			delivered, err := ht.c.Shutdown()
+			if err != nil {
+				logrus.WithFields(logrus.Fields{
+					"tid":           ht.id,
+					logrus.ErrorKey: err,
+				}).Error("hcsTask::close - failed to shutdown container")
+			}
+
+			if delivered {
+				const shutdownTimeout = time.Minute * 5
+				if err := ht.c.WaitTimeout(shutdownTimeout); err != nil {
 					logrus.WithFields(logrus.Fields{
 						"tid":           ht.id,
 						logrus.ErrorKey: err,
-					}).Error("hcsTask::close - failed to shutdown container")
-				} else {
-					const shutdownTimeout = time.Minute * 5
-					if err := ht.c.WaitTimeout(shutdownTimeout); err != nil {
-						logrus.WithFields(logrus.Fields{
-							"tid":           ht.id,
-							logrus.ErrorKey: err,
-						}).Error("hcsTask::close - failed to wait for container shutdown")
-					}
+					}).Error("hcsTask::close - failed to wait for container shutdown")
 				}
-				if err := ht.c.Terminate(); err != nil {
-					if hcs.IsAlreadyClosed(err) || hcs.IsNotExist(err) || hcs.IsAlreadyStopped(err) {
-						// This is the state we want. Do nothing.
-					} else if !hcs.IsPending(err) {
+			}
+
+			if delivered || err != nil {
+				delivered, err := ht.c.Terminate()
+				if err != nil {
+					logrus.WithFields(logrus.Fields{
+						"tid":           ht.id,
+						logrus.ErrorKey: err,
+					}).Error("hcsTask::close - failed to terminate container")
+				}
+				if delivered {
+					const terminateTimeout = time.Second * 30
+					if err := ht.c.WaitTimeout(terminateTimeout); err != nil {
 						logrus.WithFields(logrus.Fields{
 							"tid":           ht.id,
 							logrus.ErrorKey: err,
-						}).Error("hcsTask::close - failed to terminate container")
-					} else {
-						const terminateTimeout = time.Second * 30
-						if err := ht.c.WaitTimeout(terminateTimeout); err != nil {
-							logrus.WithFields(logrus.Fields{
-								"tid":           ht.id,
-								logrus.ErrorKey: err,
-							}).Error("hcsTask::close - failed to wait for container terminate")
-						}
+						}).Error("hcsTask::close - failed to wait for container terminate")
 					}
 				}
 			}

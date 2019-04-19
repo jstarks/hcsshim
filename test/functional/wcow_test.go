@@ -19,7 +19,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/wclayer"
 	"github.com/Microsoft/hcsshim/internal/wcow"
 	"github.com/Microsoft/hcsshim/osversion"
-	"github.com/Microsoft/hcsshim/test/functional/utilities"
+	testutilities "github.com/Microsoft/hcsshim/test/functional/utilities"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -196,14 +196,12 @@ func stopContainer(t *testing.T, c interface{}) {
 
 	switch c.(type) {
 	case *hcs.System:
-		if err := c.(*hcs.System).Shutdown(); err != nil {
-			if hcsshim.IsPending(err) {
-				if err := c.(*hcs.System).Wait(); err != nil {
-					t.Fatalf("Failed Wait shutdown: %s", err)
-				}
-			} else {
-				t.Fatalf("Failed shutdown: %s", err)
+		if delivered, err := c.(*hcs.System).Shutdown(); delivered {
+			if err := c.(*hcs.System).Wait(); err != nil {
+				t.Fatalf("Failed Wait shutdown: %s", err)
 			}
+		} else if err != nil {
+			t.Fatalf("Failed shutdown: %s", err)
 		}
 		c.(*hcs.System).Terminate()
 
