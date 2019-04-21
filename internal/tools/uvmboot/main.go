@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ const (
 	outputHandlingArgName       = "output-handling"
 	consolePipeArgName          = "console-pipe"
 	gcsArgName                  = "gcs"
+	waitArgName                 = "wait"
 )
 
 func main() {
@@ -82,6 +84,10 @@ func main() {
 		cli.BoolFlag{
 			Name:  gcsArgName,
 			Usage: "Launch the GCS and perform requested operations via its RPC interface",
+		},
+		cli.BoolFlag{
+			Name:  waitArgName,
+			Usage: "Keep the bridge connection until Ctrl-C is pressed",
 		},
 	}
 
@@ -271,10 +277,15 @@ func run(options *uvm.OptionsLCOW, c *cli.Context) error {
 		if err := execViaGcs(uvm.ComputeSystem(), c); err != nil {
 			return err
 		}
-		delivered, err := uvm.ComputeSystem().Terminate()
-		if delivered {
-			err = uvm.ComputeSystem().Wait(context.TODO())
-		}
+		go func() {
+			if c.GlobalBool(waitArgName) {
+				ch := make(chan os.Signal, 1)
+				signal.Notify(ch, os.Interrupt)
+				<-ch
+			}
+			uvm.ComputeSystem().Terminate()
+		}()
+		err = uvm.ComputeSystem().Wait(context.TODO())
 		if err != nil {
 			return err
 		}
