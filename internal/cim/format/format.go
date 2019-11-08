@@ -179,6 +179,14 @@ type Stream struct {
 	LengthAndType uint64       // 48, 8
 }
 
+func (s *Stream) Size() int64 {
+	return int64(s.LengthAndType & 0xffffffffffff)
+}
+
+func (s *Stream) Type() StreamType {
+	return StreamType(s.LengthAndType >> 48)
+}
+
 // A file that is a PE image can be encoded through a PeImage object in order to
 // provide a on-disk 4KB image mapping for a 512-byte aligned PE image. In this
 // case, the image is aligned well on disk for image mappings, but it is

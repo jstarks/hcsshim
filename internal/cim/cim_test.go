@@ -7,13 +7,13 @@ import (
 	"github.com/Microsoft/hcsshim/internal/cim"
 )
 
-func walk(t *testing.T, c *cim.Cim, f *cim.File, name string) {
+func walk(t *testing.T, c *cim.Cim, f *cim.File, name string, depthLeft int) {
 	fi, err := f.Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("%s %+v", name, fi)
-	if fi.Attributes&cim.FILE_ATTRIBUTE_DIRECTORY == 0 {
+	if !f.IsDir() || depthLeft == 0 {
 		return
 	}
 	des, err := f.Readdir()
@@ -26,7 +26,7 @@ func walk(t *testing.T, c *cim.Cim, f *cim.File, name string) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		walk(t, c, cf, cname)
+		walk(t, c, cf, cname, depthLeft-1)
 	}
 }
 
@@ -40,5 +40,5 @@ func TestCim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	walk(t, c, f, "/")
+	walk(t, c, f, "/", 2)
 }

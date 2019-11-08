@@ -31,7 +31,6 @@ type File struct {
 	id        FileID
 	file      format.File
 	size, off int64
-	dir       bool
 }
 
 type Stream struct{}
@@ -249,16 +248,8 @@ func (c *Cim) OpenID(id FileID) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch typ := format.StreamType(f.file.DefaultStream.LengthAndType >> 48); typ {
-	case format.StreamTypeData:
-		f.size = int64(f.file.DefaultStream.LengthAndType & (1<<48 - 1))
-
-	case format.StreamTypeLinkTable:
-		f.dir = true
-
-	case format.StreamTypePeImage:
-		f.size = 0
-		// BUGBUG
+	switch typ := f.file.DefaultStream.Type(); typ {
+	case format.StreamTypeData, format.StreamTypeLinkTable, format.StreamTypePeImage:
 
 	default:
 		return nil, fmt.Errorf("unsupported stream type: %d", typ)
@@ -297,10 +288,14 @@ const (
 	FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 )
 
+func (f *File) IsDir() bool {
+	return f.file.DefaultStream.Type() == format.StreamTypeLinkTable
+}
+
 func (f *File) Stat() (*Statbuf, error) {
 	buf := &Statbuf{
 		FileID:         f.id,
-		Size:           f.size,
+		Size:           f.file.DefaultStream.Size(),
 		ReparseTag:     f.file.ReparseTag,
 		CreationTime:   Filetime(f.file.CreationTime),
 		LastWriteTime:  Filetime(f.file.LastWriteTime),
@@ -320,7 +315,7 @@ func (f *File) Stat() (*Statbuf, error) {
 	if f.file.Flags&format.FileFlagArchive != 0 {
 		attr |= FILE_ATTRIBUTE_ARCHIVE
 	}
-	if f.dir {
+	if f.IsDir() {
 		attr |= FILE_ATTRIBUTE_DIRECTORY
 	}
 	if f.file.SdOffset != format.NullOffset {
@@ -351,12 +346,15 @@ func (f *File) Stat() (*Statbuf, error) {
 }
 
 func (f *File) Read(b []byte) (int, error) {
-	if f.dir {
+	if f.IsDir() {
 		return 0, errors.New("is a directory")
 	}
+	if typ := f.file.DefaultStream.Type(); typ != format.StreamTypeData {
+		return 0, fmt.Errorf("read of unsupported stream type %d", typ)
+	}
 	n := len(b)
-	if int64(n) > f.size-f.off {
-		n = int(f.size - f.off)
+	if int64(n) > f.file.DefaultStream.Size()-f.off {
+		n = int(f.file.DefaultStream.Size() - f.off)
 		b = b[n:]
 	}
 	n, err := f.c.readOffsetFull(b, f.file.DefaultStream.DataOffset, f.off)
@@ -374,11 +372,10 @@ type DirEntry struct {
 }
 
 func (f *File) Readdir() ([]DirEntry, error) {
-	if !f.dir {
+	if !f.IsDir() {
 		return nil, errors.New("not a directory")
 	}
-
-	size := f.file.DefaultStream.LengthAndType & 0xffffffff
+	size := f.file.DefaultStream.Size()
 	if size == 0 {
 		return nil, nil
 	}
