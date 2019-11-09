@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"time"
 	"unicode/utf16"
 
@@ -23,14 +25,22 @@ type Cim struct {
 	reg     []region
 	ftables []format.FileTableDirectoryEntry
 	upcase  []uint16
-	root    FileID
+	root    inode
 }
 
 type File struct {
-	c         *Cim
-	id        FileID
-	file      format.File
-	size, off int64
+	c          *Cim
+	name       string
+	off        int64
+	ino        inode
+	pe         format.PeImage
+	pemappings []format.PeImageMapping
+	peinit     bool
+}
+
+type inode struct {
+	id   FileID
+	file format.File
 }
 
 type Stream struct{}
@@ -141,7 +151,6 @@ func Open(imagePath string, fsName string) (_ *Cim, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading filesystem info: %s", err)
 	}
-	c.root = FileID(fs.RootDirectory)
 	c.ftables = make([]format.FileTableDirectoryEntry, fs.FileTableDirectoryLength)
 	err = c.readBin(c.ftables, fs.FileTableDirectoryOffset, 0)
 	if err != nil {
@@ -151,11 +160,11 @@ func Open(imagePath string, fsName string) (_ *Cim, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading upcase table: %s", err)
 	}
+	err = c.getInode(FileID(fs.RootDirectory), &c.root)
+	if err != nil {
+		return nil, fmt.Errorf("reading root directory: %s", err)
+	}
 	return c, nil
-}
-
-func (c *Cim) Root() FileID {
-	return c.root
 }
 
 func (c *Cim) reader(o format.RegionOffset, off, size int64) (*io.SectionReader, error) {
@@ -212,8 +221,43 @@ func (c *Cim) readBin(v interface{}, o format.RegionOffset, off int64) error {
 	return readBin(r, v)
 }
 
-func (c *Cim) OpenPath(p string) (*File, error) {
-	return nil, errors.New("OpenPath: unsupported")
+func (c *Cim) OpenAt(dirf *File, p string) (*File, error) {
+	fullp := p
+	dirOnly := len(p) > 0 && p[len(p)-1] == '/'
+	p = path.Clean(p)
+	f := &File{c: c}
+	if dirf != nil && !dirf.IsDir() {
+		return nil, fmt.Errorf("not a directory %s", dirf.name)
+	}
+	if p[0] == '/' {
+		f.ino = c.root
+		p = p[1:]
+	} else if dirf == nil {
+		f.ino = c.root
+	} else {
+		fullp = path.Join(dirf.name, fullp)
+		if dirOnly {
+			fullp += "/"
+		}
+		f.ino = dirf.ino
+	}
+	if len(p) > 0 && p != "." {
+		for _, name := range strings.Split(p, "/") {
+			fid, err := c.findChild(&f.ino, name)
+			if err != nil {
+				return nil, fmt.Errorf("file not found '%s'", fullp)
+			}
+			err = c.getInode(fid, &f.ino)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if dirOnly && !f.IsDir() {
+		return nil, fmt.Errorf("not a directory '%s'", fullp)
+	}
+	f.name = fullp
+	return f, nil
 }
 
 func (c *Cim) readFile(id FileID, file *format.File) error {
@@ -239,31 +283,45 @@ func (c *Cim) readFile(id FileID, file *format.File) error {
 	return nil
 }
 
-func (c *Cim) OpenID(id FileID) (*File, error) {
-	f := &File{
-		c:  c,
+func (c *Cim) getInode(id FileID, ino *inode) error {
+	*ino = inode{
 		id: id,
 	}
-	err := c.readFile(id, &f.file)
+	err := c.readFile(id, &ino.file)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	switch typ := f.file.DefaultStream.Type(); typ {
-	case format.StreamTypeData, format.StreamTypeLinkTable, format.StreamTypePeImage:
+	switch typ := ino.file.DefaultStream.Type(); typ {
+	case format.StreamTypeData,
+		format.StreamTypeLinkTable,
+		format.StreamTypePeImage:
 
 	default:
-		return nil, fmt.Errorf("unsupported stream type: %d", typ)
+		return fmt.Errorf("unsupported stream type: %d", typ)
 	}
-	return f, nil
+	return nil
 }
 
-type Filetime uint64
+type Filetime int64
 
 func (ft Filetime) Time() time.Time {
-	panic("unsupported")
+	if ft == 0 {
+		return time.Time{}
+	}
+	// 100-nanosecond intervals since January 1, 1601
+	nsec := int64(ft)
+	// change starting time to the Epoch (00:00:00 UTC, January 1, 1970)
+	nsec -= 116444736000000000
+	// convert into nanoseconds
+	nsec *= 100
+	return time.Unix(0, nsec)
 }
 
-type Statbuf struct {
+func (ft Filetime) String() string {
+	return ft.Time().String()
+}
+
+type FileInfo struct {
 	FileID                                                  FileID
 	Size                                                    int64
 	Attributes                                              uint32
@@ -288,77 +346,126 @@ const (
 	FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 )
 
-func (f *File) IsDir() bool {
-	return f.file.DefaultStream.Type() == format.StreamTypeLinkTable
+func (ino *inode) IsDir() bool {
+	return ino.file.DefaultStream.Type() == format.StreamTypeLinkTable
 }
 
-func (f *File) Stat() (*Statbuf, error) {
-	buf := &Statbuf{
-		FileID:         f.id,
-		Size:           f.file.DefaultStream.Size(),
-		ReparseTag:     f.file.ReparseTag,
-		CreationTime:   Filetime(f.file.CreationTime),
-		LastWriteTime:  Filetime(f.file.LastWriteTime),
-		ChangeTime:     Filetime(f.file.ChangeTime),
-		LastAccessTime: Filetime(f.file.LastAccessTime),
+func (f *File) IsDir() bool {
+	return f.ino.IsDir()
+}
+
+func (c *Cim) stat(ino *inode) (*FileInfo, error) {
+	fi := &FileInfo{
+		FileID:         ino.id,
+		Size:           ino.file.DefaultStream.Size(),
+		ReparseTag:     ino.file.ReparseTag,
+		CreationTime:   Filetime(ino.file.CreationTime),
+		LastWriteTime:  Filetime(ino.file.LastWriteTime),
+		ChangeTime:     Filetime(ino.file.ChangeTime),
+		LastAccessTime: Filetime(ino.file.LastAccessTime),
 	}
 	attr := uint32(0)
-	if f.file.Flags&format.FileFlagReadOnly != 0 {
+	if ino.file.Flags&format.FileFlagReadOnly != 0 {
 		attr |= FILE_ATTRIBUTE_READONLY
 	}
-	if f.file.Flags&format.FileFlagHidden != 0 {
+	if ino.file.Flags&format.FileFlagHidden != 0 {
 		attr |= FILE_ATTRIBUTE_HIDDEN
 	}
-	if f.file.Flags&format.FileFlagSystem != 0 {
+	if ino.file.Flags&format.FileFlagSystem != 0 {
 		attr |= FILE_ATTRIBUTE_SYSTEM
 	}
-	if f.file.Flags&format.FileFlagArchive != 0 {
+	if ino.file.Flags&format.FileFlagArchive != 0 {
 		attr |= FILE_ATTRIBUTE_ARCHIVE
 	}
-	if f.IsDir() {
+	if ino.IsDir() {
 		attr |= FILE_ATTRIBUTE_DIRECTORY
 	}
-	if f.file.SdOffset != format.NullOffset {
-		b, err := f.c.readCounted16(f.file.SdOffset)
+	if ino.file.SdOffset != format.NullOffset {
+		b, err := c.readCounted16(ino.file.SdOffset)
 		if err != nil {
 			return nil, err
 		}
-		buf.SecurityDescriptor = b
+		fi.SecurityDescriptor = b
 	}
-	if f.file.EaOffset != format.NullOffset {
-		b := make([]byte, f.file.EaLength)
-		_, err := f.c.readOffsetFull(b, f.file.EaOffset, 0)
+	if ino.file.EaOffset != format.NullOffset {
+		b := make([]byte, ino.file.EaLength)
+		_, err := c.readOffsetFull(b, ino.file.EaOffset, 0)
 		if err != nil {
 			return nil, err
 		}
-		buf.ExtendedAttributes = b
+		fi.ExtendedAttributes = b
 	}
-	if f.file.ReparseOffset != format.NullOffset {
-		b, err := f.c.readCounted16(f.file.ReparseOffset)
+	if ino.file.ReparseOffset != format.NullOffset {
+		b, err := c.readCounted16(ino.file.ReparseOffset)
 		if err != nil {
 			return nil, err
 		}
-		buf.ReparseBuffer = b
+		fi.ReparseBuffer = b
 		attr |= FILE_ATTRIBUTE_REPARSE_POINT
 	}
-	buf.Attributes = attr
-	return buf, nil
+	fi.Attributes = attr
+	return fi, nil
+}
+
+func (f *File) Stat() (*FileInfo, error) {
+	return f.c.stat(&f.ino)
+}
+
+func (f *File) getPESegment(off int64) (int64, int64, error) {
+	if !f.peinit {
+		err := f.c.readBin(&f.pe, f.ino.file.DefaultStream.DataOffset, 0)
+		if err != nil {
+			return 0, 0, fmt.Errorf("reading PE image descriptor: %s", err)
+		}
+		f.pe.DataLength &= 0x7fffffffffffffff // avoid returning negative lengths
+		f.pemappings = make([]format.PeImageMapping, f.pe.MappingCount)
+		err = f.c.readBin(f.pemappings, f.ino.file.DefaultStream.DataOffset, int64(binary.Size(&f.pe)))
+		if err != nil {
+			return 0, 0, fmt.Errorf("reading PE image mappings: %s", err)
+		}
+		f.peinit = true
+	}
+	d := int64(0)
+	end := f.pe.DataLength
+	for _, m := range f.pemappings {
+		if int64(m.FileOffset) > off {
+			end = int64(m.FileOffset)
+			break
+		}
+		d = int64(m.Delta)
+	}
+	return d, end - d, nil
 }
 
 func (f *File) Read(b []byte) (int, error) {
 	if f.IsDir() {
 		return 0, errors.New("is a directory")
 	}
-	if typ := f.file.DefaultStream.Type(); typ != format.StreamTypeData {
+	if typ := f.ino.file.DefaultStream.Type(); typ != format.StreamTypeData {
 		return 0, fmt.Errorf("read of unsupported stream type %d", typ)
 	}
 	n := len(b)
-	if int64(n) > f.file.DefaultStream.Size()-f.off {
-		n = int(f.file.DefaultStream.Size() - f.off)
-		b = b[n:]
+	rem := f.ino.file.DefaultStream.Size() - f.off
+	if int64(n) > rem {
+		n = int(rem)
 	}
-	n, err := f.c.readOffsetFull(b, f.file.DefaultStream.DataOffset, f.off)
+	off := f.off
+	if f.ino.file.DefaultStream.Type() == format.StreamTypePeImage {
+		delta, segrem, err := f.getPESegment(f.off)
+		if err != nil {
+			return 0, err
+		}
+		if int64(n) > segrem {
+			n = int(segrem)
+		}
+		off += delta
+	}
+	n, err := f.c.readOffsetFull(b[:n], f.ino.file.DefaultStream.DataOffset, off)
 	f.off += int64(n)
+	rem -= int64(n)
+	if err == nil && rem == 0 {
+		err = io.EOF
+	}
 	return n, err
 }
 
@@ -366,41 +473,140 @@ func (f *File) OpenStream(name string) (*Stream, error) {
 	return nil, errors.New("unsupported")
 }
 
-type DirEntry struct {
-	Name   string
-	FileID FileID
+func (c *Cim) nameEq(a string, b []uint16) bool {
+	for _, ar := range a {
+		if len(b) < 1 {
+			return false
+		}
+		if ar < format.UpcaseTableLength {
+			ar = rune(c.upcase[int(ar)])
+		}
+		br := rune(b[0])
+		bs := 1
+		if utf16.IsSurrogate(br) {
+			if len(b) == 1 {
+				return false
+			}
+			br = utf16.DecodeRune(br, rune(b[1]))
+			if br == '\ufffd' {
+				return false
+			}
+			bs++
+		} else {
+			br = rune(c.upcase[int(br)])
+		}
+		if ar != br {
+			return false
+		}
+		b = b[bs:]
+	}
+	return len(b) == 0
 }
 
-func (f *File) Readdir() ([]DirEntry, error) {
-	if !f.IsDir() {
-		return nil, errors.New("not a directory")
+func (c *Cim) nameLt(a string, b []uint16) bool {
+	for _, ar := range a {
+		if len(b) < 1 {
+			return false
+		}
+		if ar < format.UpcaseTableLength {
+			ar = rune(c.upcase[int(ar)])
+		}
+		br := rune(b[0])
+		bs := 1
+		if utf16.IsSurrogate(br) {
+			if len(b) == 1 {
+				return false
+			}
+			br = utf16.DecodeRune(br, rune(b[1]))
+			if br == '\ufffd' {
+				return false
+			}
+			bs++
+		}
+		if ar < br {
+			return true
+		} else if ar > br {
+			return false
+		}
+		b = b[bs:]
 	}
-	size := f.file.DefaultStream.Size()
-	if size == 0 {
-		return nil, nil
-	}
-	b := make([]byte, size)
-	_, err := f.c.readOffsetFull(b, f.file.DefaultStream.DataOffset, 0)
-	if err != nil {
-		return nil, fmt.Errorf("reading link table: %s", err)
-	}
+	return len(b) > 0
+}
 
+func (c *Cim) findChild(ino *inode, name string) (FileID, error) {
+	// TODO binary search
+	var foundID FileID
+	err := c.enumDirectory(ino, func(name16 []uint16, fid FileID) error {
+		if c.nameEq(name, name16) {
+			foundID = fid
+			return io.EOF
+		}
+		return nil
+	})
+	if err == io.EOF {
+		return foundID, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return 0, errors.New("file not found")
+}
+
+func enumLinkTable(b []byte, esize int, f func([]uint16, []byte) error) error {
 	var lt format.LinkTable
 	r := bytes.NewReader(b)
 	readBin(r, &lt)
 	fids := b[8:]
 	nos := fids[lt.LinkCount*4:]
-	des := make([]DirEntry, lt.LinkCount)
-	for i := range des {
+	for i := 0; i < int(lt.LinkCount); i++ {
 		r.Seek(int64(binary.LittleEndian.Uint32(nos[i*4:])), 0)
 		var nl uint16
-		readBin(r, &nl)
+		if err := readBin(r, &nl); err != nil {
+			return fmt.Errorf("parsing name length: %s", err)
+		}
 		name16 := make([]uint16, nl)
-		readBin(r, name16)
-		des[i].FileID = FileID(binary.LittleEndian.Uint32(fids[i*4:]))
-		des[i].Name = string(utf16.Decode(name16))
+		if err := readBin(r, name16); err != nil {
+			return fmt.Errorf("parsing name: %s", err)
+		}
+		if err := f(name16, fids[i*esize:(i+1)*esize]); err != nil {
+			return err
+		}
 	}
-	return des, nil
+	return nil
+}
+
+func (c *Cim) enumDirectory(ino *inode, fn func(name16 []uint16, fid FileID) error) error {
+	if !ino.IsDir() {
+		return errors.New("not a directory")
+	}
+	size := ino.file.DefaultStream.Size()
+	if size == 0 {
+		return nil
+	}
+	b := make([]byte, size)
+	_, err := c.readOffsetFull(b, ino.file.DefaultStream.DataOffset, 0)
+	if err != nil {
+		return fmt.Errorf("reading link table: %s", err)
+	}
+	return enumLinkTable(b, 4, func(name16 []uint16, fid []uint8) error {
+		return fn(name16, FileID(binary.LittleEndian.Uint32(fid)))
+	})
+}
+
+func (f *File) Name() string {
+	return f.name
+}
+
+func (f *File) Readdir() ([]string, error) {
+	var names []string
+	err := f.c.enumDirectory(&f.ino, func(name16 []uint16, fid FileID) error {
+		names = append(names, string(utf16.Decode(name16)))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return names, nil
 }
 
 func (c *Cim) Close() error {

@@ -193,7 +193,7 @@ func (s *Stream) Type() StreamType {
 // discontiguous for ordinary reads.
 type PeImage struct {
 	DataOffset   RegionOffset
-	DataLength   uint64
+	DataLength   int64
 	ImageLength  uint32
 	MappingCount uint16
 	Flags        uint16 // ValidImage
