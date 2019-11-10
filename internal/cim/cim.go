@@ -288,8 +288,8 @@ func (c *Cim) readFile(id FileID, file *format.File) error {
 		}
 		c.ftables[tid] = b
 	}
-	// TODO avoid this second copy (needed because the on-disk file size may be
-	// smaller than format.File).
+	// This second copy is needed because the on-disk file size may be smaller
+	// than format.File).
 	b := make([]byte, binary.Size(file))
 	copy(b, c.ftables[tid][tfid*esize:(tfid+1)*esize])
 	readBin(bytes.NewReader(b), file)
