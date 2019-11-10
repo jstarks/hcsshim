@@ -30,7 +30,7 @@ type Cim struct {
 	upcase     []uint16
 	root       *inode
 	cm         sync.Mutex
-	inodeCache map[FileID]*inode
+	inodeCache map[format.FileID]*inode
 	sdCache    map[format.RegionOffset][]byte
 }
 
@@ -42,7 +42,7 @@ type File struct {
 }
 
 type inode struct {
-	id         FileID
+	id         format.FileID
 	file       format.File
 	linkTable  []byte
 	pe         format.PeImage
@@ -51,8 +51,6 @@ type inode struct {
 }
 
 type Stream struct{}
-
-type FileID uint32
 
 func readBin(r io.Reader, v interface{}) error {
 	err := binary.Read(r, binary.LittleEndian, v)
@@ -133,7 +131,7 @@ func Open(imagePath string, fsName string) (_ *Cim, err error) {
 	c := &Cim{
 		reg:        make([]region, regionCount),
 		upcase:     make([]uint16, format.UpcaseTableLength),
-		inodeCache: make(map[FileID]*inode),
+		inodeCache: make(map[format.FileID]*inode),
 		sdCache:    make(map[format.RegionOffset][]byte),
 	}
 	defer func() {
@@ -170,7 +168,7 @@ func Open(imagePath string, fsName string) (_ *Cim, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading upcase table: %s", err)
 	}
-	c.root, err = c.getInode(FileID(fs.RootDirectory))
+	c.root, err = c.getInode(fs.RootDirectory)
 	if err != nil {
 		return nil, fmt.Errorf("reading root directory: %s", err)
 	}
@@ -270,7 +268,7 @@ func (c *Cim) OpenAt(dirf *File, p string) (*File, error) {
 	return f, nil
 }
 
-func (c *Cim) readFile(id FileID, file *format.File) error {
+func (c *Cim) readFile(id format.FileID, file *format.File) error {
 	if id == 0 {
 		return fmt.Errorf("invalid file ID %#x", id)
 	}
@@ -296,7 +294,7 @@ func (c *Cim) readFile(id FileID, file *format.File) error {
 	return nil
 }
 
-func (c *Cim) getInode(id FileID) (*inode, error) {
+func (c *Cim) getInode(id format.FileID) (*inode, error) {
 	c.cm.Lock()
 	ino, ok := c.inodeCache[id]
 	c.cm.Unlock()
@@ -344,7 +342,7 @@ func (ft Filetime) String() string {
 }
 
 type FileInfo struct {
-	FileID                                                  FileID
+	FileID                                                  uint64
 	Size                                                    int64
 	Attributes                                              uint32
 	ReparseTag                                              uint32
@@ -395,7 +393,7 @@ func (c *Cim) getSd(o format.RegionOffset) ([]byte, error) {
 
 func (c *Cim) stat(ino *inode) (*FileInfo, error) {
 	fi := &FileInfo{
-		FileID:         ino.id,
+		FileID:         uint64(ino.id),
 		Size:           ino.file.DefaultStream.Size(),
 		ReparseTag:     ino.file.ReparseTag,
 		CreationTime:   Filetime(ino.file.CreationTime),
@@ -615,7 +613,7 @@ func (c *Cim) getDirectoryTable(ino *inode) ([]byte, error) {
 	return ino.linkTable, nil
 }
 
-func (c *Cim) findChild(ino *inode, name string) (FileID, error) {
+func (c *Cim) findChild(ino *inode, name string) (format.FileID, error) {
 	table, err := c.getDirectoryTable(ino)
 	if err != nil {
 		return 0, err
@@ -626,7 +624,7 @@ func (c *Cim) findChild(ino *inode, name string) (FileID, error) {
 			return 0, err
 		}
 		if b != nil {
-			return FileID(binary.LittleEndian.Uint32(b)), nil
+			return format.FileID(binary.LittleEndian.Uint32(b)), nil
 		}
 	}
 	return 0, errors.New("file not found")
