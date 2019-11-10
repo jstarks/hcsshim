@@ -10,8 +10,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
-	"unicode/utf16"
 
 	"github.com/Microsoft/hcsshim/internal/cim/format"
 )
@@ -21,11 +21,16 @@ type region struct {
 	size int64
 }
 
+type fileTable []byte
+
 type Cim struct {
 	reg     []region
-	ftables []format.FileTableDirectoryEntry
+	ftdes   []format.FileTableDirectoryEntry
+	ftables []fileTable
 	upcase  []uint16
 	root    inode
+	cm      sync.Mutex
+	sdCache map[format.RegionOffset][]byte
 }
 
 type File struct {
@@ -39,8 +44,9 @@ type File struct {
 }
 
 type inode struct {
-	id   FileID
-	file format.File
+	id        FileID
+	file      format.File
+	linkTable []byte
 }
 
 type Stream struct{}
@@ -67,7 +73,7 @@ func validateHeader(h *format.CommonHeader) error {
 
 func loadRegionSet(rs *format.RegionSet, imagePath string, reg []region) (int, error) {
 	for i := 0; i < int(rs.Count); i++ {
-		name := fmt.Sprintf("region_%v_%d", rs.Id, i)
+		name := fmt.Sprintf("region_%v_%d", rs.ID, i)
 		rf, err := os.Open(filepath.Join(imagePath, name))
 		if err != nil {
 			return 0, err
@@ -124,8 +130,9 @@ func Open(imagePath string, fsName string) (_ *Cim, err error) {
 		return nil, fmt.Errorf("invalid region count %d", regionCount)
 	}
 	c := &Cim{
-		reg:    make([]region, regionCount),
-		upcase: make([]uint16, format.UpcaseTableLength),
+		reg:     make([]region, regionCount),
+		upcase:  make([]uint16, format.UpcaseTableLength),
+		sdCache: make(map[format.RegionOffset][]byte),
 	}
 	defer func() {
 		if err != nil {
@@ -151,8 +158,9 @@ func Open(imagePath string, fsName string) (_ *Cim, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading filesystem info: %s", err)
 	}
-	c.ftables = make([]format.FileTableDirectoryEntry, fs.FileTableDirectoryLength)
-	err = c.readBin(c.ftables, fs.FileTableDirectoryOffset, 0)
+	c.ftables = make([]fileTable, fs.FileTableDirectoryLength)
+	c.ftdes = make([]format.FileTableDirectoryEntry, fs.FileTableDirectoryLength)
+	err = c.readBin(c.ftdes, fs.FileTableDirectoryOffset, 0)
 	if err != nil {
 		return nil, fmt.Errorf("reading file table directory: %s", err)
 	}
@@ -229,21 +237,22 @@ func (c *Cim) OpenAt(dirf *File, p string) (*File, error) {
 	if dirf != nil && !dirf.IsDir() {
 		return nil, fmt.Errorf("not a directory %s", dirf.name)
 	}
+	var ino *inode
 	if p[0] == '/' {
-		f.ino = c.root
+		ino = &c.root
 		p = p[1:]
 	} else if dirf == nil {
-		f.ino = c.root
+		ino = &c.root
 	} else {
 		fullp = path.Join(dirf.name, fullp)
 		if dirOnly {
 			fullp += "/"
 		}
-		f.ino = dirf.ino
+		ino = &dirf.ino
 	}
 	if len(p) > 0 && p != "." {
 		for _, name := range strings.Split(p, "/") {
-			fid, err := c.findChild(&f.ino, name)
+			fid, err := c.findChild(ino, name)
 			if err != nil {
 				return nil, fmt.Errorf("file not found '%s'", fullp)
 			}
@@ -251,7 +260,10 @@ func (c *Cim) OpenAt(dirf *File, p string) (*File, error) {
 			if err != nil {
 				return nil, err
 			}
+			ino = &f.ino
 		}
+	} else {
+		f.ino = *ino
 	}
 	if dirOnly && !f.IsDir() {
 		return nil, fmt.Errorf("not a directory '%s'", fullp)
@@ -265,20 +277,23 @@ func (c *Cim) readFile(id FileID, file *format.File) error {
 		return fmt.Errorf("invalid file ID %#x", id)
 	}
 	tid := uint64((id - 1) / format.FilesPerTable)
-	tfid := uint16((id - 1) % format.FilesPerTable)
-	if tid >= uint64(len(c.ftables)) || tfid >= c.ftables[tid].Count {
+	tfid := int((id - 1) % format.FilesPerTable)
+	if tid >= uint64(len(c.ftdes)) || tfid >= int(c.ftdes[tid].Count) {
 		return fmt.Errorf("invalid file ID %#x", id)
 	}
-	esize := int(c.ftables[tid].EntrySize)
-	size := binary.Size(file)
-	if size > esize {
-		size = esize
+	esize := int(c.ftdes[tid].EntrySize)
+	if c.ftables[tid] == nil {
+		b := make([]byte, esize*int(c.ftdes[tid].Count))
+		_, err := c.readOffsetFull(b, c.ftdes[tid].Offset, 0)
+		if err != nil {
+			return fmt.Errorf("reading file table %d: %s", tid, err)
+		}
+		c.ftables[tid] = b
 	}
+	// TODO avoid this second copy (needed because the on-disk file size may be
+	// smaller than format.File).
 	b := make([]byte, binary.Size(file))
-	_, err := c.readOffsetFull(b[:size], c.ftables[tid].Offset, int64(tfid)*int64(esize))
-	if err != nil {
-		return err
-	}
+	copy(b, c.ftables[tid][tfid*esize:(tfid+1)*esize])
 	readBin(bytes.NewReader(b), file)
 	return nil
 }
@@ -354,6 +369,23 @@ func (f *File) IsDir() bool {
 	return f.ino.IsDir()
 }
 
+func (c *Cim) getSd(o format.RegionOffset) ([]byte, error) {
+	c.cm.Lock()
+	if sd, ok := c.sdCache[o]; ok {
+		c.cm.Unlock()
+		return sd, nil
+	}
+	c.cm.Unlock()
+	sd, err := c.readCounted16(o)
+	if err != nil {
+		return nil, err
+	}
+	c.cm.Lock()
+	c.sdCache[o] = sd
+	c.cm.Unlock()
+	return sd, nil
+}
+
 func (c *Cim) stat(ino *inode) (*FileInfo, error) {
 	fi := &FileInfo{
 		FileID:         ino.id,
@@ -381,11 +413,11 @@ func (c *Cim) stat(ino *inode) (*FileInfo, error) {
 		attr |= FILE_ATTRIBUTE_DIRECTORY
 	}
 	if ino.file.SdOffset != format.NullOffset {
-		b, err := c.readCounted16(ino.file.SdOffset)
+		sd, err := c.getSd(ino.file.SdOffset)
 		if err != nil {
 			return nil, err
 		}
-		fi.SecurityDescriptor = b
+		fi.SecurityDescriptor = sd
 	}
 	if ino.file.EaOffset != format.NullOffset {
 		b := make([]byte, ino.file.EaLength)
@@ -473,124 +505,115 @@ func (f *File) OpenStream(name string) (*Stream, error) {
 	return nil, errors.New("unsupported")
 }
 
-func (c *Cim) nameEq(a string, b []uint16) bool {
-	for _, ar := range a {
-		if len(b) < 1 {
-			return false
+func parseName(b []byte, nos []byte, i int) ([]byte, error) {
+	size := uint32(len(b))
+	no := binary.LittleEndian.Uint32(nos[i*4:])
+	if no > size-2 {
+		return nil, fmt.Errorf("invalid name offset %d > %d", no, size-2)
+	}
+	nl := binary.LittleEndian.Uint16(b[no:])
+	if mnl := (size - 2 - no) / 2; uint32(nl) > mnl {
+		return nil, fmt.Errorf("invalid name length %d > %d", nl, mnl)
+	}
+	return b[no+2 : no+2+uint32(nl)*2], nil
+}
+
+func (c *Cim) bsearchLinkTable(b []byte, esize int, name string) ([]byte, error) {
+	if len(b) == 0 {
+		return nil, nil
+	}
+	n := binary.LittleEndian.Uint32(b[4:])
+	es := b[8:]
+	nos := es[n*4:]
+	lo := 0
+	hi := int(n)
+	i := hi / 2
+	for hi > lo {
+		name16, err := parseName(b, nos, i)
+		if err != nil {
+			return nil, err
 		}
-		if ar < format.UpcaseTableLength {
-			ar = rune(c.upcase[int(ar)])
-		}
-		br := rune(b[0])
-		bs := 1
-		if utf16.IsSurrogate(br) {
-			if len(b) == 1 {
-				return false
-			}
-			br = utf16.DecodeRune(br, rune(b[1]))
-			if br == '\ufffd' {
-				return false
-			}
-			bs++
+		cmp := cmpcaseUtf8Utf16LE(name, name16, c.upcase)
+		if cmp < 0 {
+			hi = i
+		} else if cmp == 0 {
+			return es[i*esize : (i+1)*esize], nil
 		} else {
-			br = rune(c.upcase[int(br)])
+			lo = i
 		}
-		if ar != br {
-			return false
-		}
-		b = b[bs:]
+		i = lo + (hi-lo)/2
 	}
-	return len(b) == 0
+	return nil, nil
 }
 
-func (c *Cim) nameLt(a string, b []uint16) bool {
-	for _, ar := range a {
-		if len(b) < 1 {
-			return false
-		}
-		if ar < format.UpcaseTableLength {
-			ar = rune(c.upcase[int(ar)])
-		}
-		br := rune(b[0])
-		bs := 1
-		if utf16.IsSurrogate(br) {
-			if len(b) == 1 {
-				return false
-			}
-			br = utf16.DecodeRune(br, rune(b[1]))
-			if br == '\ufffd' {
-				return false
-			}
-			bs++
-		}
-		if ar < br {
-			return true
-		} else if ar > br {
-			return false
-		}
-		b = b[bs:]
-	}
-	return len(b) > 0
-}
-
-func (c *Cim) findChild(ino *inode, name string) (FileID, error) {
-	// TODO binary search
-	var foundID FileID
-	err := c.enumDirectory(ino, func(name16 []uint16, fid FileID) error {
-		if c.nameEq(name, name16) {
-			foundID = fid
-			return io.EOF
-		}
+func enumLinkTable(b []byte, esize int, f func(string, []byte) error) error {
+	if len(b) == 0 {
 		return nil
-	})
-	if err == io.EOF {
-		return foundID, nil
 	}
-	if err != nil {
-		return 0, err
-	}
-	return 0, errors.New("file not found")
-}
-
-func enumLinkTable(b []byte, esize int, f func([]uint16, []byte) error) error {
 	var lt format.LinkTable
 	r := bytes.NewReader(b)
 	readBin(r, &lt)
-	fids := b[8:]
-	nos := fids[lt.LinkCount*4:]
+	es := b[8:]
+	nos := es[lt.LinkCount*4:]
 	for i := 0; i < int(lt.LinkCount); i++ {
-		r.Seek(int64(binary.LittleEndian.Uint32(nos[i*4:])), 0)
-		var nl uint16
-		if err := readBin(r, &nl); err != nil {
-			return fmt.Errorf("parsing name length: %s", err)
+		name, err := parseName(b, nos, i)
+		if err != nil {
+			return err
 		}
-		name16 := make([]uint16, nl)
-		if err := readBin(r, name16); err != nil {
-			return fmt.Errorf("parsing name: %s", err)
-		}
-		if err := f(name16, fids[i*esize:(i+1)*esize]); err != nil {
+		if err := f(parseUtf16LE(name), es[i*esize:(i+1)*esize]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Cim) enumDirectory(ino *inode, fn func(name16 []uint16, fid FileID) error) error {
-	if !ino.IsDir() {
-		return errors.New("not a directory")
+func (c *Cim) getDirectoryTable(ino *inode) ([]byte, error) {
+	if ino.linkTable == nil && ino.IsDir() {
+		ssize := ino.file.DefaultStream.Size()
+		if ssize == 0 {
+			return nil, nil
+		}
+		b := make([]byte, ssize)
+		_, err := c.readOffsetFull(b, ino.file.DefaultStream.DataOffset, 0)
+		if err != nil {
+			return nil, fmt.Errorf("reading link table: %s", err)
+		}
+		if len(b) < 8 {
+			return nil, fmt.Errorf("invalid link table size %d", len(b))
+		}
+		size := binary.LittleEndian.Uint32(b[0:])
+		n := binary.LittleEndian.Uint32(b[4:])
+		if size < 8 {
+			return nil, fmt.Errorf("invalid link table size %d", size)
+		}
+		if int64(size) > int64(len(b)) {
+			return nil, fmt.Errorf("link table size mismatch %d < %d", len(b), size)
+		}
+		b = b[:size]
+		esize := 4
+		if maxn := size - 8/(uint32(esize)+4); maxn < n {
+			return nil, fmt.Errorf("link table count mismatch %d < %d", maxn, n)
+		}
+		ino.linkTable = b
 	}
-	size := ino.file.DefaultStream.Size()
-	if size == 0 {
-		return nil
-	}
-	b := make([]byte, size)
-	_, err := c.readOffsetFull(b, ino.file.DefaultStream.DataOffset, 0)
+	return ino.linkTable, nil
+}
+
+func (c *Cim) findChild(ino *inode, name string) (FileID, error) {
+	table, err := c.getDirectoryTable(ino)
 	if err != nil {
-		return fmt.Errorf("reading link table: %s", err)
+		return 0, err
 	}
-	return enumLinkTable(b, 4, func(name16 []uint16, fid []uint8) error {
-		return fn(name16, FileID(binary.LittleEndian.Uint32(fid)))
-	})
+	if table != nil {
+		b, err := c.bsearchLinkTable(table, 4, name)
+		if err != nil {
+			return 0, err
+		}
+		if b != nil {
+			return FileID(binary.LittleEndian.Uint32(b)), nil
+		}
+	}
+	return 0, errors.New("file not found")
 }
 
 func (f *File) Name() string {
@@ -598,9 +621,16 @@ func (f *File) Name() string {
 }
 
 func (f *File) Readdir() ([]string, error) {
+	if !f.ino.IsDir() {
+		return nil, errors.New("not a directory")
+	}
+	table, err := f.c.getDirectoryTable(&f.ino)
+	if err != nil {
+		return nil, err
+	}
 	var names []string
-	err := f.c.enumDirectory(&f.ino, func(name16 []uint16, fid FileID) error {
-		names = append(names, string(utf16.Decode(name16)))
+	err = enumLinkTable(table, 4, func(name string, fid []byte) error {
+		names = append(names, name)
 		return nil
 	})
 	if err != nil {

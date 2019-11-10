@@ -5,8 +5,8 @@ import "github.com/Microsoft/go-winio/pkg/guid"
 // PageSize is the alignment of data for large files inside a CIM.
 const PageSize = 4096
 
-// Offsets to objects are stored as index of the region file containing the
-// object and the byte offset within that file.
+// RegionOffset encodes an offset to objects as index of the region file
+// containing the object and the byte offset within that file.
 type RegionOffset uint64
 
 func (o RegionOffset) ByteOffset() int64 {
@@ -24,7 +24,7 @@ func NewRegionOffset(off int64, index uint16) RegionOffset {
 // NullOffset indicates that the specified object does not exist.
 const NullOffset = RegionOffset(0)
 
-// Files start with a magic number.
+// Magic specifies the magic number at the beginning of a file.
 type Magic [8]uint8
 
 var MagicValue = Magic([8]uint8{'c', 'i', 'm', 'f', 'i', 'l', 'e', '0'})
@@ -40,10 +40,10 @@ type FileType uint8
 const (
 	FtImage FileType = iota
 	FtRegion
-	FtObjectId
+	FtObjectID
 )
 
-// The common header for all CIM-related files.
+// CommonHeader is the common header for all CIM-related files.
 type CommonHeader struct {
 	Magic        Magic
 	HeaderLength uint32
@@ -76,7 +76,7 @@ const (
 	RtCount
 )
 
-// Header for the region file.
+// RegionHeader is the header for the region file.
 type RegionHeader struct {
 	Common    CommonHeader
 	Index     uint16
@@ -93,7 +93,7 @@ type RegionHeader struct {
 
 const ObjectIdFileName = "objectid"
 
-// Header for the object ID file.
+// ObjectIdHeader is the header for the object ID file.
 type ObjectIdHeader struct {
 	Common      CommonHeader
 	Index       uint16
@@ -104,27 +104,27 @@ type ObjectIdHeader struct {
 	Count       uint32
 }
 
-// The object ID itself, containing a length and a digest.
-type ObjectId struct {
+// ObjectID is the object ID itself, containing a length and a digest.
+type ObjectID struct {
 	Length uint64
 	Digest [24]uint8
 }
 
-// Each object ID entry contains the object ID and the byte offset into the
-// corresponding region file.
+// ObjectIdEntry is an entry in the object ID file. It contains the object ID
+// and the byte offset into the corresponding region file.
 type ObjectIdEntry struct {
-	ObjectId ObjectId
+	ObjectID ObjectID
 	Offset   uint64
 }
 
 type RegionSet struct {
-	Id        guid.GUID
+	ID        guid.GUID
 	Count     uint16
 	Reserved  uint16
 	Reserved1 uint32
 }
 
-// Filesystem file
+// FilesystemHeader is the header for a filesystem file.
 //
 // The filesystem file points to the filesystem object inside a region
 // file and specifies regions sets.
@@ -142,8 +142,8 @@ const UpcaseTableLength = 0x10000 // Only characters in the BMP are upcased
 
 type FileID uint32
 
-// A filesystem object specifies a root directory and other metadata necessary
-// to define a filesystem.
+// Filesystem specifies a root directory and other metadata necessary to define
+// a filesystem.
 type Filesystem struct {
 	UpcaseTableOffset        RegionOffset
 	FileTableDirectoryOffset RegionOffset
@@ -151,9 +151,10 @@ type Filesystem struct {
 	RootDirectory            FileID
 }
 
-// Files are laid out in a series of file tables, and file tables are specified
-// by a directory. The file table directory entry specifies the number of valid
-// files within the table, as well as the entry size (which may grow to specify
+// FileTableDirectoryEntry is the entry within a file table directory. Files are
+// laid out in a series of file tables, and file tables are specified by a
+// directory. The file table directory entry specifies the number of valid files
+// within the table, as well as the entry size (which may grow to specify
 // additional file metadata in the future).
 type FileTableDirectoryEntry struct {
 	Offset    RegionOffset
@@ -172,8 +173,8 @@ const (
 	StreamTypePeImage
 )
 
-// A stream may point to file data, a link table (for directories), or a PeImage
-// object for files that are PE images.
+// Stream describes a stream data and offset. It may point to file data, a link
+// table (for directories), or a PeImage object for files that are PE images.
 type Stream struct {
 	DataOffset    RegionOffset // stream data or PeImage object
 	LengthAndType uint64       // 48, 8
@@ -187,17 +188,17 @@ func (s *Stream) Type() StreamType {
 	return StreamType(s.LengthAndType >> 48)
 }
 
-// A file that is a PE image can be encoded through a PeImage object in order to
-// provide a on-disk 4KB image mapping for a 512-byte aligned PE image. In this
-// case, the image is aligned well on disk for image mappings, but it is
-// discontiguous for ordinary reads.
+// PeImage is the stream data for a file that is a PE image. It provides an
+// on-disk 4KB image mapping for a 512-byte aligned PE image. In this case, the
+// image is aligned well on disk for image mappings, but it is discontiguous for
+// ordinary reads.
 type PeImage struct {
 	DataOffset   RegionOffset
 	DataLength   int64
 	ImageLength  uint32
 	MappingCount uint16
 	Flags        uint16 // ValidImage
-	// PeImageMapping Mappings[];
+	// Mappings  []PeImageMapping
 }
 
 type PeImageMapping struct {
@@ -214,7 +215,7 @@ const (
 	FileFlagArchive
 )
 
-// A file represents a file in a file system.
+// File represents a file in a file system.
 type File struct {
 	Flags             FileFlags
 	EaLength          uint16
@@ -233,18 +234,18 @@ type File struct {
 const MaximumEaNameLength = 254
 const MaximumFullEaLength = 0xffff
 
-// A file name is always a wide string
+// Name represents a file's name
 type Name struct {
 	Length uint16
-	// gsl::byte Bytes[];
+	// Bytes []uint8
 }
 
-// A link table stores either directory entries or alternate data streams.
+// LinkTable stores either directory entries or alternate data streams.
 type LinkTable struct {
 	Length    uint32
 	LinkCount uint32
-	// T Values[];
-	// uint32 NameOffsets[];
+	// Values []T
+	// NameOffsets []uint32
 }
 
 const MaximumComponentNameLength = 255
