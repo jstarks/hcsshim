@@ -19,7 +19,7 @@ import (
 var (
 	// ErrFileNotFound indicates that a file with the requested path was not
 	// found.
-	ErrFileNotFound = errors.New("file not found")
+	ErrFileNotFound = errors.New("no such file or directory")
 	// ErrNotADirectory indicates that a directory operation was attempted on a
 	// non-directory file.
 	ErrNotADirectory = errors.New("not a directory")
@@ -35,8 +35,8 @@ type region struct {
 
 type fileTable []byte
 
-// A Cim is a CIM file opened for read access.
-type Cim struct {
+// A Reader is a CIM file opened for read access.
+type Reader struct {
 	name       string
 	reg        []region
 	ftdes      []format.FileTableDirectoryEntry
@@ -50,9 +50,9 @@ type Cim struct {
 
 // A File is a file or directory within an open CIM.
 type File struct {
-	c    *Cim
+	r    *Reader
 	name string
-	r    streamReader
+	sr   streamReader
 	ino  *inode
 }
 
@@ -73,14 +73,14 @@ type streamReader struct {
 
 // A Stream is an alternate data stream of a file within a CIM.
 type Stream struct {
-	c     *Cim
+	c     *Reader
 	r     streamReader
 	fname string
 	name  string
 }
 
-// CimError is the error type returned by most functions in this package.
-type CimError struct {
+// ReaderError is the error type returned by most functions in this package.
+type ReaderError struct {
 	Cim    string
 	Op     string
 	Path   string
@@ -88,7 +88,7 @@ type CimError struct {
 	Err    error
 }
 
-func (e *CimError) Error() string {
+func (e *ReaderError) Error() string {
 	s := "cim " + e.Op + " " + e.Cim
 	if e.Path != "" {
 		s += ":" + e.Path
@@ -145,10 +145,10 @@ func loadRegionSet(rs *format.RegionSet, imagePath string, reg []region) (int, e
 }
 
 // Open opens a CIM file for read access.
-func Open(p string) (_ *Cim, err error) {
+func Open(p string) (_ *Reader, err error) {
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: p, Op: "open", Err: err}
+			err = &ReaderError{Cim: p, Op: "open", Err: err}
 		}
 	}()
 	f, err := os.Open(p)
@@ -177,7 +177,7 @@ func Open(p string) (_ *Cim, err error) {
 	if regionCount == 0 || regionCount > 0x10000 {
 		return nil, fmt.Errorf("invalid region count %d", regionCount)
 	}
-	c := &Cim{
+	c := &Reader{
 		name:       p,
 		reg:        make([]region, regionCount),
 		upcase:     make([]uint16, format.UpcaseTableLength),
@@ -227,20 +227,20 @@ func Open(p string) (_ *Cim, err error) {
 }
 
 // Close releases resources associated with the Cim.
-func (c *Cim) Close() error {
-	for i := range c.reg {
-		c.reg[i].f.Close()
+func (cr *Reader) Close() error {
+	for i := range cr.reg {
+		cr.reg[i].f.Close()
 	}
 	return nil
 }
 
-func (c *Cim) reader(o format.RegionOffset, off, size int64) (*io.SectionReader, error) {
+func (cr *Reader) objReader(o format.RegionOffset, off, size int64) (*io.SectionReader, error) {
 	oi := int(o.RegionIndex())
 	ob := o.ByteOffset()
-	if oi >= len(c.reg) || ob == 0 {
+	if oi >= len(cr.reg) || ob == 0 {
 		return nil, fmt.Errorf("invalid region offset 0x%x", o)
 	}
-	reg := c.reg[oi]
+	reg := cr.reg[oi]
 	if ob > reg.size || off > reg.size-ob {
 		return nil, fmt.Errorf("%s: invalid region offset 0x%x", reg.f.Name(), o)
 	}
@@ -253,8 +253,8 @@ func (c *Cim) reader(o format.RegionOffset, off, size int64) (*io.SectionReader,
 	return io.NewSectionReader(reg.f, ob+off, size), nil
 }
 
-func (c *Cim) readCounted(o format.RegionOffset, csize int) ([]byte, error) {
-	r, err := c.reader(o, 0, -1)
+func (cr *Reader) readCounted(o format.RegionOffset, csize int) ([]byte, error) {
+	r, err := cr.objReader(o, 0, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -284,16 +284,16 @@ func (c *Cim) readCounted(o format.RegionOffset, csize int) ([]byte, error) {
 	return b, nil
 }
 
-func (c *Cim) readOffsetFull(b []byte, o format.RegionOffset, off int64) (int, error) {
-	r, err := c.reader(o, off, int64(len(b)))
+func (cr *Reader) readOffsetFull(b []byte, o format.RegionOffset, off int64) (int, error) {
+	r, err := cr.objReader(o, off, int64(len(b)))
 	if err != nil {
 		return 0, err
 	}
 	return io.ReadFull(r, b)
 }
 
-func (c *Cim) readBin(v interface{}, o format.RegionOffset, off int64) error {
-	r, err := c.reader(o, off, int64(binary.Size(v)))
+func (cr *Reader) readBin(v interface{}, o format.RegionOffset, off int64) error {
+	r, err := cr.objReader(o, off, int64(binary.Size(v)))
 	if err != nil {
 		return err
 	}
@@ -303,11 +303,11 @@ func (c *Cim) readBin(v interface{}, o format.RegionOffset, off int64) error {
 // OpenAt returns a file associated with path `p`, relative to `dirf`. If `dirf`
 // is nil or `p` starts with '/', then the path will be opened relative to the
 // CIM root.
-func (c *Cim) OpenAt(dirf *File, p string) (_ *File, err error) {
+func (cr *Reader) OpenAt(dirf *File, p string) (_ *File, err error) {
 	fullp := p
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: c.name, Path: fullp, Op: "openat", Err: err}
+			err = &ReaderError{Cim: cr.name, Path: fullp, Op: "openat", Err: err}
 		}
 	}()
 	dirOnly := len(p) > 0 && p[len(p)-1] == '/'
@@ -317,10 +317,10 @@ func (c *Cim) OpenAt(dirf *File, p string) (_ *File, err error) {
 	}
 	var ino *inode
 	if p[0] == '/' {
-		ino = c.root
+		ino = cr.root
 		p = p[1:]
 	} else if dirf == nil {
-		ino = c.root
+		ino = cr.root
 	} else {
 		fullp = path.Join(dirf.name, fullp)
 		if dirOnly {
@@ -330,11 +330,11 @@ func (c *Cim) OpenAt(dirf *File, p string) (_ *File, err error) {
 	}
 	if len(p) > 0 && p != "." {
 		for _, name := range strings.Split(p, "/") {
-			fid, err := c.findChild(ino, name)
+			fid, err := cr.findChild(ino, name)
 			if err != nil {
 				return nil, ErrFileNotFound
 			}
-			ino, err = c.getInode(fid)
+			ino, err = cr.getInode(fid)
 			if err != nil {
 				return nil, err
 			}
@@ -344,51 +344,51 @@ func (c *Cim) OpenAt(dirf *File, p string) (_ *File, err error) {
 		return nil, ErrNotADirectory
 	}
 	f := &File{
-		c:    c,
+		r:    cr,
 		name: fullp,
 		ino:  ino,
-		r:    streamReader{stream: ino.file.DefaultStream},
+		sr:   streamReader{stream: ino.file.DefaultStream},
 	}
 	return f, nil
 }
 
-func (c *Cim) readFile(id format.FileID, file *format.File) error {
+func (cr *Reader) readFile(id format.FileID, file *format.File) error {
 	if id == 0 {
 		return fmt.Errorf("invalid file ID %#x", id)
 	}
 	tid := uint64((id - 1) / format.FilesPerTable)
 	tfid := int((id - 1) % format.FilesPerTable)
-	if tid >= uint64(len(c.ftdes)) || tfid >= int(c.ftdes[tid].Count) {
+	if tid >= uint64(len(cr.ftdes)) || tfid >= int(cr.ftdes[tid].Count) {
 		return fmt.Errorf("invalid file ID %#x", id)
 	}
-	esize := int(c.ftdes[tid].EntrySize)
-	if c.ftables[tid] == nil {
-		b := make([]byte, esize*int(c.ftdes[tid].Count))
-		_, err := c.readOffsetFull(b, c.ftdes[tid].Offset, 0)
+	esize := int(cr.ftdes[tid].EntrySize)
+	if cr.ftables[tid] == nil {
+		b := make([]byte, esize*int(cr.ftdes[tid].Count))
+		_, err := cr.readOffsetFull(b, cr.ftdes[tid].Offset, 0)
 		if err != nil {
 			return fmt.Errorf("reading file table %d: %s", tid, err)
 		}
-		c.ftables[tid] = b
+		cr.ftables[tid] = b
 	}
 	// This second copy is needed because the on-disk file size may be smaller
 	// than format.File).
 	b := make([]byte, binary.Size(file))
-	copy(b, c.ftables[tid][tfid*esize:(tfid+1)*esize])
+	copy(b, cr.ftables[tid][tfid*esize:(tfid+1)*esize])
 	readBin(bytes.NewReader(b), file)
 	return nil
 }
 
-func (c *Cim) getInode(id format.FileID) (*inode, error) {
-	c.cm.Lock()
-	ino, ok := c.inodeCache[id]
-	c.cm.Unlock()
+func (cr *Reader) getInode(id format.FileID) (*inode, error) {
+	cr.cm.Lock()
+	ino, ok := cr.inodeCache[id]
+	cr.cm.Unlock()
 	if ok {
 		return ino, nil
 	}
 	ino = &inode{
 		id: id,
 	}
-	err := c.readFile(id, &ino.file)
+	err := cr.readFile(id, &ino.file)
 	if err != nil {
 		return nil, err
 	}
@@ -400,9 +400,9 @@ func (c *Cim) getInode(id format.FileID) (*inode, error) {
 	default:
 		return nil, fmt.Errorf("unsupported stream type: %d", typ)
 	}
-	c.cm.Lock()
-	c.inodeCache[id] = ino
-	c.cm.Unlock()
+	cr.cm.Lock()
+	cr.inodeCache[id] = ino
+	cr.cm.Unlock()
 	return ino, nil
 }
 
@@ -458,24 +458,24 @@ func (f *File) IsDir() bool {
 	return f.ino.IsDir()
 }
 
-func (c *Cim) getSd(o format.RegionOffset) ([]byte, error) {
-	c.cm.Lock()
-	sd, ok := c.sdCache[o]
-	c.cm.Unlock()
+func (cr *Reader) getSd(o format.RegionOffset) ([]byte, error) {
+	cr.cm.Lock()
+	sd, ok := cr.sdCache[o]
+	cr.cm.Unlock()
 	if ok {
 		return sd, nil
 	}
-	sd, err := c.readCounted(o, 2)
+	sd, err := cr.readCounted(o, 2)
 	if err != nil {
 		return nil, fmt.Errorf("reading security descriptor at 0x%x: %s", o, err)
 	}
-	c.cm.Lock()
-	c.sdCache[o] = sd
-	c.cm.Unlock()
+	cr.cm.Lock()
+	cr.sdCache[o] = sd
+	cr.cm.Unlock()
 	return sd, nil
 }
 
-func (c *Cim) stat(ino *inode) (*FileInfo, error) {
+func (cr *Reader) stat(ino *inode) (*FileInfo, error) {
 	fi := &FileInfo{
 		FileID:         uint64(ino.id),
 		Size:           ino.file.DefaultStream.Size(),
@@ -502,7 +502,7 @@ func (c *Cim) stat(ino *inode) (*FileInfo, error) {
 		attr |= FILE_ATTRIBUTE_DIRECTORY
 	}
 	if ino.file.SdOffset != format.NullOffset {
-		sd, err := c.getSd(ino.file.SdOffset)
+		sd, err := cr.getSd(ino.file.SdOffset)
 		if err != nil {
 			return nil, err
 		}
@@ -510,14 +510,14 @@ func (c *Cim) stat(ino *inode) (*FileInfo, error) {
 	}
 	if ino.file.EaOffset != format.NullOffset {
 		b := make([]byte, ino.file.EaLength)
-		_, err := c.readOffsetFull(b, ino.file.EaOffset, 0)
+		_, err := cr.readOffsetFull(b, ino.file.EaOffset, 0)
 		if err != nil {
 			return nil, fmt.Errorf("reading EA buffer at %#x: %s", ino.file.EaOffset, err)
 		}
 		fi.ExtendedAttributes = b
 	}
 	if ino.file.ReparseOffset != format.NullOffset {
-		b, err := c.readCounted(ino.file.ReparseOffset, 2)
+		b, err := cr.readCounted(ino.file.ReparseOffset, 2)
 		if err != nil {
 			return nil, fmt.Errorf("reading reparse buffer at %#x: %s", ino.file.EaOffset, err)
 		}
@@ -530,30 +530,30 @@ func (c *Cim) stat(ino *inode) (*FileInfo, error) {
 
 // Stat returns a FileInfo for the file.
 func (f *File) Stat() (*FileInfo, error) {
-	fi, err := f.c.stat(f.ino)
+	fi, err := f.r.stat(f.ino)
 	if err != nil {
-		err = &CimError{Cim: f.c.name, Path: f.name, Op: "stat", Err: err}
+		err = &ReaderError{Cim: f.r.name, Path: f.name, Op: "stat", Err: err}
 	}
 	return fi, err
 }
 
-func (c *Cim) getPESegment(r *streamReader, off int64) (int64, int64, error) {
-	if !r.peinit {
-		err := c.readBin(&r.pe, r.stream.DataOffset, 0)
+func (cr *Reader) getPESegment(sr *streamReader, off int64) (int64, int64, error) {
+	if !sr.peinit {
+		err := cr.readBin(&sr.pe, sr.stream.DataOffset, 0)
 		if err != nil {
 			return 0, 0, fmt.Errorf("reading PE image descriptor: %s", err)
 		}
-		r.pe.DataLength &= 0x7fffffffffffffff // avoid returning negative lengths
-		r.pemappings = make([]format.PeImageMapping, r.pe.MappingCount)
-		err = c.readBin(r.pemappings, r.stream.DataOffset, int64(binary.Size(&r.pe)))
+		sr.pe.DataLength &= 0x7fffffffffffffff // avoid returning negative lengths
+		sr.pemappings = make([]format.PeImageMapping, sr.pe.MappingCount)
+		err = cr.readBin(sr.pemappings, sr.stream.DataOffset, int64(binary.Size(&sr.pe)))
 		if err != nil {
 			return 0, 0, fmt.Errorf("reading PE image mappings: %s", err)
 		}
-		r.peinit = true
+		sr.peinit = true
 	}
 	d := int64(0)
-	end := r.pe.DataLength
-	for _, m := range r.pemappings {
+	end := sr.pe.DataLength
+	for _, m := range sr.pemappings {
 		if int64(m.FileOffset) > off {
 			end = int64(m.FileOffset)
 			break
@@ -563,27 +563,27 @@ func (c *Cim) getPESegment(r *streamReader, off int64) (int64, int64, error) {
 	return d, end - off, nil
 }
 
-func (c *Cim) readStream(r *streamReader, b []byte) (_ int, err error) {
+func (cr *Reader) readStream(sr *streamReader, b []byte) (_ int, err error) {
 	n := len(b)
-	rem := r.stream.Size() - r.off
+	rem := sr.stream.Size() - sr.off
 	if int64(n) > rem {
 		n = int(rem)
 	}
-	ro := r.stream.DataOffset
-	off := r.off
-	if r.stream.Type() == format.StreamTypePeImage {
-		delta, segrem, err := c.getPESegment(r, r.off)
+	ro := sr.stream.DataOffset
+	off := sr.off
+	if sr.stream.Type() == format.StreamTypePeImage {
+		delta, segrem, err := cr.getPESegment(sr, sr.off)
 		if err != nil {
 			return 0, err
 		}
 		if int64(n) > segrem {
 			n = int(segrem)
 		}
-		ro = r.pe.DataOffset
+		ro = sr.pe.DataOffset
 		off += delta
 	}
-	n, err = c.readOffsetFull(b[:n], ro, off)
-	r.off += int64(n)
+	n, err = cr.readOffsetFull(b[:n], ro, off)
+	sr.off += int64(n)
 	rem -= int64(n)
 	if err == nil && rem == 0 {
 		err = io.EOF
@@ -594,13 +594,13 @@ func (c *Cim) readStream(r *streamReader, b []byte) (_ int, err error) {
 func (f *File) Read(b []byte) (_ int, err error) {
 	defer func() {
 		if err != nil && err != io.EOF {
-			err = &CimError{Cim: f.c.name, Path: f.Name(), Op: "read", Err: err}
+			err = &ReaderError{Cim: f.r.name, Path: f.Name(), Op: "read", Err: err}
 		}
 	}()
 	if f.IsDir() {
 		return 0, ErrIsADirectory
 	}
-	return f.c.readStream(&f.r, b)
+	return f.r.readStream(&f.sr, b)
 }
 
 const (
@@ -693,16 +693,16 @@ func validateLinkTable(b []byte, esize int) error {
 	return nil
 }
 
-func (c *Cim) getDirectoryTable(ino *inode) ([]byte, error) {
+func (cr *Reader) getDirectoryTable(ino *inode) ([]byte, error) {
 	if !ino.IsDir() || ino.file.DefaultStream.Size() == 0 {
 		return nil, nil
 	}
-	c.cm.Lock()
+	cr.cm.Lock()
 	b := ino.linkTable
-	c.cm.Unlock()
+	cr.cm.Unlock()
 	if b == nil {
 		b = make([]byte, ino.file.DefaultStream.Size())
-		_, err := c.readOffsetFull(b, ino.file.DefaultStream.DataOffset, 0)
+		_, err := cr.readOffsetFull(b, ino.file.DefaultStream.DataOffset, 0)
 		if err != nil {
 			return nil, fmt.Errorf("reading directory link table: %s", err)
 		}
@@ -710,20 +710,20 @@ func (c *Cim) getDirectoryTable(ino *inode) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		c.cm.Lock()
+		cr.cm.Lock()
 		ino.linkTable = b
-		c.cm.Unlock()
+		cr.cm.Unlock()
 	}
 	return b, nil
 }
 
-func (c *Cim) findChild(ino *inode, name string) (format.FileID, error) {
-	table, err := c.getDirectoryTable(ino)
+func (cr *Reader) findChild(ino *inode, name string) (format.FileID, error) {
+	table, err := cr.getDirectoryTable(ino)
 	if err != nil {
 		return 0, err
 	}
 	if table != nil {
-		b, err := bsearchLinkTable(table, fileIDSize, name, c.upcase)
+		b, err := bsearchLinkTable(table, fileIDSize, name, cr.upcase)
 		if err != nil {
 			return 0, err
 		}
@@ -744,13 +744,13 @@ func (f *File) Name() string {
 func (f *File) Readdir() (_ []string, err error) {
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: f.c.name, Path: f.name, Op: "readdir", Err: err}
+			err = &ReaderError{Cim: f.r.name, Path: f.name, Op: "readdir", Err: err}
 		}
 	}()
 	if !f.ino.IsDir() {
 		return nil, ErrNotADirectory
 	}
-	table, err := f.c.getDirectoryTable(f.ino)
+	table, err := f.r.getDirectoryTable(f.ino)
 	if err != nil {
 		return nil, err
 	}
@@ -765,15 +765,15 @@ func (f *File) Readdir() (_ []string, err error) {
 	return names, nil
 }
 
-func (c *Cim) getStreamTable(ino *inode) ([]byte, error) {
+func (cr *Reader) getStreamTable(ino *inode) ([]byte, error) {
 	if ino.file.StreamTableOffset == format.NullOffset {
 		return nil, nil
 	}
-	c.cm.Lock()
+	cr.cm.Lock()
 	table := ino.streamTable
-	c.cm.Unlock()
+	cr.cm.Unlock()
 	if table == nil {
-		b, err := c.readCounted(ino.file.StreamTableOffset, 4)
+		b, err := cr.readCounted(ino.file.StreamTableOffset, 4)
 		if err != nil {
 			return nil, fmt.Errorf("reading stream link table: %s", err)
 		}
@@ -782,9 +782,9 @@ func (c *Cim) getStreamTable(ino *inode) ([]byte, error) {
 			return nil, err
 		}
 		table = b
-		c.cm.Lock()
+		cr.cm.Lock()
 		ino.streamTable = table
-		c.cm.Unlock()
+		cr.cm.Unlock()
 	}
 	return table, nil
 }
@@ -793,10 +793,10 @@ func (c *Cim) getStreamTable(ino *inode) ([]byte, error) {
 func (f *File) Readstreams() (_ []string, err error) {
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: f.c.name, Path: f.name, Op: "readstreams", Err: err}
+			err = &ReaderError{Cim: f.r.name, Path: f.name, Op: "readstreams", Err: err}
 		}
 	}()
-	table, err := f.c.getStreamTable(f.ino)
+	table, err := f.r.getStreamTable(f.ino)
 	if err != nil {
 		return nil, err
 	}
@@ -815,20 +815,20 @@ func (f *File) Readstreams() (_ []string, err error) {
 func (f *File) OpenStream(name string) (_ *Stream, err error) {
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: f.c.name, Path: f.name, Stream: name, Op: "openstream", Err: err}
+			err = &ReaderError{Cim: f.r.name, Path: f.name, Stream: name, Op: "openstream", Err: err}
 		}
 	}()
-	table, err := f.c.getStreamTable(f.ino)
+	table, err := f.r.getStreamTable(f.ino)
 	if err != nil {
 		return nil, err
 	}
 	if table != nil {
-		sb, err := bsearchLinkTable(table, streamSize, name, f.c.upcase)
+		sb, err := bsearchLinkTable(table, streamSize, name, f.r.upcase)
 		if err != nil {
 			return nil, err
 		}
 		if sb != nil {
-			s := &Stream{c: f.c, fname: f.name, name: name}
+			s := &Stream{c: f.r, fname: f.name, name: name}
 			readBin(bytes.NewReader(sb), &s.r.stream)
 			if typ := s.r.stream.Type(); typ != format.StreamTypeData {
 				return nil, fmt.Errorf("unsupported stream type %d", typ)
@@ -842,7 +842,7 @@ func (f *File) OpenStream(name string) (_ *Stream, err error) {
 func (s *Stream) Read(b []byte) (int, error) {
 	n, err := s.c.readStream(&s.r, b)
 	if err != nil && err != io.EOF {
-		err = &CimError{Cim: s.c.name, Path: s.fname, Stream: s.name, Op: "read", Err: err}
+		err = &ReaderError{Cim: s.c.name, Path: s.fname, Stream: s.name, Op: "read", Err: err}
 	}
 	return n, err
 }
