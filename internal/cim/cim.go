@@ -116,23 +116,19 @@ func loadRegionSet(rs *format.RegionSet, imagePath string, reg []region) (int, e
 			return 0, err
 		}
 		reg[i].f = rf
-		size, err := rf.Seek(0, 2)
+		fi, err := rf.Stat()
 		if err != nil {
 			return 0, err
 		}
-		_, err = rf.Seek(0, 0)
-		if err != nil {
-			return 0, err
-		}
-		reg[i].size = size
+		reg[i].size = fi.Size()
 		var rh format.RegionHeader
 		err = readBin(rf, &rh)
 		if err != nil {
-			return 0, fmt.Errorf("reading region header: %s", err)
+			return 0, fmt.Errorf("reading region header %s: %s", name, err)
 		}
 		err = validateHeader(&rh.Common)
 		if err != nil {
-			return 0, fmt.Errorf("validating region header: %s", err)
+			return 0, fmt.Errorf("validating region header %s: %s", name, err)
 		}
 	}
 	return int(rs.Count), nil
@@ -230,17 +226,17 @@ func (c *Cim) reader(o format.RegionOffset, off, size int64) (*io.SectionReader,
 	oi := int(o.RegionIndex())
 	ob := o.ByteOffset()
 	if oi >= len(c.reg) || ob == 0 {
-		return nil, fmt.Errorf("invalid region offset %x", o)
+		return nil, fmt.Errorf("invalid region offset 0x%x", o)
 	}
 	reg := c.reg[oi]
 	if ob > reg.size || off > reg.size-ob {
-		return nil, fmt.Errorf("%s: invalid region offset %x", reg.f.Name(), o)
+		return nil, fmt.Errorf("%s: invalid region offset 0x%x", reg.f.Name(), o)
 	}
 	maxsize := reg.size - ob - off
 	if size < 0 {
 		size = maxsize
 	} else if size > maxsize {
-		return nil, fmt.Errorf("%s: invalid region size %x at offset %x", reg.f.Name(), size, o)
+		return nil, fmt.Errorf("%s: invalid region size %x at offset 0x%x", reg.f.Name(), size, o)
 	}
 	return io.NewSectionReader(reg.f, ob+off, size), nil
 }
@@ -451,7 +447,7 @@ func (c *Cim) getSd(o format.RegionOffset) ([]byte, error) {
 	}
 	sd, err := c.readCounted(o, 2)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading security descriptor at 0x%x: %s", o, err)
 	}
 	c.cm.Lock()
 	c.sdCache[o] = sd
@@ -496,14 +492,14 @@ func (c *Cim) stat(ino *inode) (*FileInfo, error) {
 		b := make([]byte, ino.file.EaLength)
 		_, err := c.readOffsetFull(b, ino.file.EaOffset, 0)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("reading EA buffer at %#x: %s", ino.file.EaOffset, err)
 		}
 		fi.ExtendedAttributes = b
 	}
 	if ino.file.ReparseOffset != format.NullOffset {
 		b, err := c.readCounted(ino.file.ReparseOffset, 2)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("reading reparse buffer at %#x: %s", ino.file.EaOffset, err)
 		}
 		fi.ReparseBuffer = b
 		attr |= FILE_ATTRIBUTE_REPARSE_POINT
@@ -534,7 +530,6 @@ func (c *Cim) getPESegment(r *streamReader, off int64) (int64, int64, error) {
 		}
 		r.peinit = true
 	}
-	fmt.Fprintf(os.Stderr, "%+v\n", r.pemappings)
 	d := int64(0)
 	end := r.pe.DataLength
 	for _, m := range r.pemappings {
@@ -688,7 +683,7 @@ func (c *Cim) getDirectoryTable(ino *inode) ([]byte, error) {
 		b = make([]byte, ino.file.DefaultStream.Size())
 		_, err := c.readOffsetFull(b, ino.file.DefaultStream.DataOffset, 0)
 		if err != nil {
-			return nil, fmt.Errorf("reading link table: %s", err)
+			return nil, fmt.Errorf("reading directory link table: %s", err)
 		}
 		err = validateLinkTable(b, fileIDSize)
 		if err != nil {
@@ -756,7 +751,7 @@ func (c *Cim) getStreamTable(ino *inode) ([]byte, error) {
 	if table == nil {
 		b, err := c.readCounted(ino.file.StreamTableOffset, 4)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("reading stream link table: %s", err)
 		}
 		err = validateLinkTable(b, streamSize)
 		if err != nil {
@@ -837,5 +832,5 @@ func (s *Stream) Stat() (*StreamInfo, error) {
 }
 
 func (s *Stream) Name() string {
-	return s.fname + ":" + s.name
+	return s.name
 }
