@@ -17,9 +17,15 @@ import (
 )
 
 var (
-	ErrFileNotFound  = errors.New("file not found")
+	// ErrFileNotFound indicates that a file with the requested path was not
+	// found.
+	ErrFileNotFound = errors.New("file not found")
+	// ErrNotADirectory indicates that a directory operation was attempted on a
+	// non-directory file.
 	ErrNotADirectory = errors.New("not a directory")
-	ErrIsADirectory  = errors.New("is a directory")
+	// ErrIsADirectory indicates that a non-directory operation was attempted on
+	// a directory.
+	ErrIsADirectory = errors.New("is a directory")
 )
 
 type region struct {
@@ -29,6 +35,7 @@ type region struct {
 
 type fileTable []byte
 
+// A Cim is a CIM file opened for read access.
 type Cim struct {
 	name       string
 	reg        []region
@@ -41,6 +48,7 @@ type Cim struct {
 	sdCache    map[format.RegionOffset][]byte
 }
 
+// A File is a file or directory within an open CIM.
 type File struct {
 	c    *Cim
 	name string
@@ -63,6 +71,7 @@ type streamReader struct {
 	peinit     bool
 }
 
+// A Stream is an alternate data stream of a file within a CIM.
 type Stream struct {
 	c     *Cim
 	r     streamReader
@@ -70,6 +79,7 @@ type Stream struct {
 	name  string
 }
 
+// CimError is the error type returned by most functions in this package.
 type CimError struct {
 	Cim    string
 	Op     string
@@ -134,8 +144,8 @@ func loadRegionSet(rs *format.RegionSet, imagePath string, reg []region) (int, e
 	return int(rs.Count), nil
 }
 
-func Open(imagePath string, fsName string) (_ *Cim, err error) {
-	p := filepath.Join(imagePath, fsName)
+// Open opens a CIM file for read access.
+func Open(p string) (_ *Cim, err error) {
 	defer func() {
 		if err != nil {
 			err = &CimError{Cim: p, Op: "open", Err: err}
@@ -180,6 +190,7 @@ func Open(imagePath string, fsName string) (_ *Cim, err error) {
 		}
 	}()
 
+	imagePath := filepath.Dir(p)
 	reg := c.reg
 	for i := range parents {
 		n, err := loadRegionSet(&parents[i], imagePath, reg)
@@ -215,6 +226,7 @@ func Open(imagePath string, fsName string) (_ *Cim, err error) {
 	return c, nil
 }
 
+// Close releases resources associated with the Cim.
 func (c *Cim) Close() error {
 	for i := range c.reg {
 		c.reg[i].f.Close()
@@ -288,6 +300,9 @@ func (c *Cim) readBin(v interface{}, o format.RegionOffset, off int64) error {
 	return readBin(r, v)
 }
 
+// OpenAt returns a file associated with path `p`, relative to `dirf`. If `dirf`
+// is nil or `p` starts with '/', then the path will be opened relative to the
+// CIM root.
 func (c *Cim) OpenAt(dirf *File, p string) (_ *File, err error) {
 	fullp := p
 	defer func() {
@@ -391,8 +406,10 @@ func (c *Cim) getInode(id format.FileID) (*inode, error) {
 	return ino, nil
 }
 
+// Filetime is a Windows FILETIME, in 100-ns units since January 1, 1601.
 type Filetime int64
 
+// Time returns a Go time equivalent to `ft`.
 func (ft Filetime) Time() time.Time {
 	if ft == 0 {
 		return time.Time{}
@@ -410,6 +427,7 @@ func (ft Filetime) String() string {
 	return ft.Time().String()
 }
 
+// A FileInfo specifies information about a file.
 type FileInfo struct {
 	FileID                                                  uint64
 	Size                                                    int64
@@ -421,6 +439,7 @@ type FileInfo struct {
 	ReparseBuffer                                           []byte
 }
 
+// Windows file attributes.
 const (
 	FILE_ATTRIBUTE_READONLY      = 0x00000001
 	FILE_ATTRIBUTE_HIDDEN        = 0x00000002
@@ -434,6 +453,7 @@ func (ino *inode) IsDir() bool {
 	return ino.file.DefaultStream.Type() == format.StreamTypeLinkTable
 }
 
+// IsDir returns whether a file is a directory.
 func (f *File) IsDir() bool {
 	return f.ino.IsDir()
 }
@@ -508,6 +528,7 @@ func (c *Cim) stat(ino *inode) (*FileInfo, error) {
 	return fi, nil
 }
 
+// Stat returns a FileInfo for the file.
 func (f *File) Stat() (*FileInfo, error) {
 	fi, err := f.c.stat(f.ino)
 	if err != nil {
@@ -713,10 +734,13 @@ func (c *Cim) findChild(ino *inode, name string) (format.FileID, error) {
 	return 0, ErrFileNotFound
 }
 
+// Name returns the file's name.
 func (f *File) Name() string {
 	return f.name
 }
 
+// Readdir returns a slice of file names that are children of the directory.
+// Fails if `f` is not a directory.
 func (f *File) Readdir() (_ []string, err error) {
 	defer func() {
 		if err != nil {
@@ -765,6 +789,7 @@ func (c *Cim) getStreamTable(ino *inode) ([]byte, error) {
 	return table, nil
 }
 
+// Readstreams returns the names of the alternate data streams for a file.
 func (f *File) Readstreams() (_ []string, err error) {
 	defer func() {
 		if err != nil {
@@ -786,6 +811,7 @@ func (f *File) Readstreams() (_ []string, err error) {
 	return names, nil
 }
 
+// OpenStream opens an alternate data stream by name.
 func (f *File) OpenStream(name string) (_ *Stream, err error) {
 	defer func() {
 		if err != nil {
@@ -821,16 +847,19 @@ func (s *Stream) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// A StreamInfo describes a stream.
 type StreamInfo struct {
 	Size int64
 }
 
+// Stat returns information about the stream.
 func (s *Stream) Stat() (*StreamInfo, error) {
 	return &StreamInfo{
 		Size: s.r.stream.Size(),
 	}, nil
 }
 
+// Name returns the name of the stream.
 func (s *Stream) Name() string {
 	return s.name
 }

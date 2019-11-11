@@ -43,7 +43,7 @@ func walk(c *cim.Cim, f *cim.File, depthLeft int, fn func(*cim.File, *cim.Stream
 }
 
 func TestCim(t *testing.T) {
-	c, err := cim.Open(`testdata`, "layer.fs")
+	c, err := cim.Open("testdata/layer.fs")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestCim(t *testing.T) {
 }
 
 func TestOpen(t *testing.T) {
-	c, err := cim.Open(`testdata`, "layer.fs")
+	c, err := cim.Open("testdata/layer.fs")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestOpen(t *testing.T) {
 }
 
 func TestOpenMissing(t *testing.T) {
-	c, err := cim.Open(`testdata`, "layer.fs")
+	c, err := cim.Open("testdata/layer.fs")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestOpenMissing(t *testing.T) {
 }
 
 func BenchmarkStat(b *testing.B) {
-	c, err := cim.Open(`testdata`, "layer.fs")
+	c, err := cim.Open("testdata/layer.fs")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func BenchmarkStat(b *testing.B) {
 }
 
 func BenchmarkOpen(b *testing.B) {
-	c, err := cim.Open(`testdata`, "layer.fs")
+	c, err := cim.Open("testdata/layer.fs")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func BenchmarkOpen(b *testing.B) {
 }
 
 func BenchmarkOpenAbsolute(b *testing.B) {
-	c, err := cim.Open(`testdata`, "layer.fs")
+	c, err := cim.Open("testdata/layer.fs")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func BenchmarkOpenAbsolute(b *testing.B) {
 }
 
 func BenchmarkWalk(b *testing.B) {
-	c, err := cim.Open(`testdata`, "layer.fs")
+	c, err := cim.Open("testdata/layer.fs")
 	if err != nil {
 		b.Fatal(err)
 	}
