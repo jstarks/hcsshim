@@ -6,8 +6,25 @@ import (
 	"github.com/Microsoft/hcsshim/internal/cim"
 )
 
-func walk(c *cim.Cim, f *cim.File, depthLeft int, fn func(*cim.File) error) error {
-	fn(f)
+func walk(c *cim.Cim, f *cim.File, depthLeft int, fn func(*cim.File, *cim.Stream) error) error {
+	err := fn(f, nil)
+	if err != nil {
+		return err
+	}
+	ss, err := f.Readstreams()
+	if err != nil {
+		return err
+	}
+	for _, sn := range ss {
+		s, err := f.OpenStream(sn)
+		if err != nil {
+			return err
+		}
+		err = fn(f, s)
+		if err != nil {
+			return err
+		}
+	}
 	if !f.IsDir() || depthLeft == 0 {
 		return nil
 	}
@@ -35,12 +52,20 @@ func TestCim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = walk(c, f, 2, func(f *cim.File) error {
-		fi, err := f.Stat()
-		if err != nil {
-			t.Fatal(err)
+	err = walk(c, f, 3, func(f *cim.File, s *cim.Stream) error {
+		if s == nil {
+			fi, err := f.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("%s: %+v", f.Name(), fi)
+		} else {
+			si, err := s.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("%s:%s: %+v", f.Name(), s.Name(), si)
 		}
-		t.Logf("%s: %+v", f.Name(), fi)
 		return nil
 	})
 	if err != nil {
@@ -63,6 +88,18 @@ func TestOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("%s: %+v", f.Name(), fi)
+}
+
+func TestOpenMissing(t *testing.T) {
+	c, err := cim.Open(`testdata`, "layer.fs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, err = c.OpenAt(nil, "Files/WindowsX")
+	if cerr, ok := err.(*cim.CimError); !ok || cerr.Err != cim.ErrFileNotFound {
+		t.Fatalf("expected cim error got %s", err)
+	}
 }
 
 func BenchmarkStat(b *testing.B) {
@@ -126,7 +163,7 @@ func BenchmarkWalk(b *testing.B) {
 		b.Fatal(err)
 	}
 	for i := 0; i < b.N; i++ {
-		err = walk(c, f, -1, func(f *cim.File) error {
+		err = walk(c, f, -1, func(f *cim.File, s *cim.Stream) error {
 			return nil
 		})
 		if err != nil {
