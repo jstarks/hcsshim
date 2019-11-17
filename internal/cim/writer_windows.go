@@ -1,30 +1,12 @@
 package cim
 
 import (
-	"os"
+	"errors"
+	"path/filepath"
 	"unsafe"
 
-	"github.com/Microsoft/go-winio"
-	"github.com/Microsoft/go-winio/pkg/guid"
-	"github.com/pkg/errors"
 	"golang.org/x/sys/windows"
 )
-
-// FileInfo represents the metadata for a single file in the image.
-type FileInfoX struct {
-	Size int64
-
-	CreationTime   windows.Filetime
-	LastWriteTime  windows.Filetime
-	ChangeTime     windows.Filetime
-	LastAccessTime windows.Filetime
-
-	Attributes uint32
-
-	SecurityDescriptor []byte
-	ReparseData        []byte
-	ExtendedAttributes []winio.ExtendedAttribute
-}
 
 type fileInfoInternal struct {
 	Attributes uint32
@@ -48,22 +30,25 @@ type fileInfoInternal struct {
 type fsHandle uintptr
 type streamHandle uintptr
 
-// FileSystem represents a single CimFS filesystem. On disk, the image is
+// Writer represents a single CimFS filesystem. On disk, the image is
 // composed of a filesystem file and several object ID and region files.
-type FileSystem struct {
+type Writer struct {
 	handle       fsHandle
 	activeStream streamHandle
 }
 
-// Open opens an existing CimFS filesystem, or creates one if it doesn't exist.
-func OpenWriter(imagePath string, oldFSName string, newFSName string) (*FileSystem, error) {
-	if err := os.MkdirAll(imagePath, 0); err != nil {
-		return nil, err
-	}
+func Create(p string) (*Writer, error) {
+	return create(filepath.Dir(p), "", filepath.Base(p))
+}
+
+func Append(p string, newfsname string) (*Writer, error) {
+	return create(filepath.Dir(p), filepath.Base(p), newfsname)
+}
+
+func create(imagePath string, oldFSName string, newFSName string) (*Writer, error) {
 	var err error
 	var oldNameBytes *uint16
 	if oldFSName != "" {
-		oldFSName = oldFSName + ".fs"
 		oldNameBytes, err = windows.UTF16PtrFromString(oldFSName)
 		if err != nil {
 			return nil, err
@@ -71,7 +56,6 @@ func OpenWriter(imagePath string, oldFSName string, newFSName string) (*FileSyst
 	}
 	var newNameBytes *uint16
 	if newFSName != "" {
-		newFSName = newFSName + ".fs"
 		newNameBytes, err = windows.UTF16PtrFromString(newFSName)
 		if err != nil {
 			return nil, err
@@ -81,8 +65,7 @@ func OpenWriter(imagePath string, oldFSName string, newFSName string) (*FileSyst
 	if err := cimCreateImage(imagePath, oldNameBytes, newNameBytes, &handle); err != nil {
 		return nil, err
 	}
-
-	return &FileSystem{handle: handle}, nil
+	return &Writer{handle: handle}, nil
 }
 
 func (ft Filetime) toWindows() windows.Filetime {
@@ -95,7 +78,7 @@ func (ft Filetime) toWindows() windows.Filetime {
 // AddFile adds an entry for a file to the image. The file is added at the
 // specified path. After calling this function, the file is set as the active
 // stream for the image, so data can be written by calling `Write`.
-func (fs *FileSystem) AddFile(path string, info *FileInfo) error {
+func (w *Writer) AddFile(path string, info *FileInfo) error {
 	infoInternal := &fileInfoInternal{
 		Attributes:     info.Attributes,
 		FileSize:       info.Size,
@@ -120,16 +103,16 @@ func (fs *FileSystem) AddFile(path string, info *FileInfo) error {
 		infoInternal.EACount = uint32(len(info.ExtendedAttributes))
 	}
 
-	return cimCreateFile(fs.handle, path, infoInternal, &fs.activeStream)
+	return cimCreateFile(w.handle, path, infoInternal, &w.activeStream)
 }
 
 // Write writes bytes to the active stream.
-func (fs *FileSystem) Write(p []byte) (int, error) {
-	if fs.activeStream == 0 {
+func (w *Writer) Write(p []byte) (int, error) {
+	if w.activeStream == 0 {
 		return 0, errors.New("No active stream")
 	}
 
-	err := cimWriteStream(fs.activeStream, uintptr(unsafe.Pointer(&p[0])), uint32(len(p)))
+	err := cimWriteStream(w.activeStream, uintptr(unsafe.Pointer(&p[0])), uint32(len(p)))
 	if err != nil {
 		return 0, err
 	}
@@ -138,41 +121,30 @@ func (fs *FileSystem) Write(p []byte) (int, error) {
 }
 
 // CloseStream closes the active stream.
-func (fs *FileSystem) CloseStream() error {
-	if fs.activeStream == 0 {
+func (w *Writer) CloseStream() error {
+	if w.activeStream == 0 {
 		return errors.New("No active stream")
 	}
 
-	return cimCloseStream(fs.activeStream)
+	return cimCloseStream(w.activeStream)
 }
 
 // TODO do this as part of Close?
-func (fs *FileSystem) Commit() error {
-	return cimCommitImage(fs.handle)
+func (w *Writer) Commit() error {
+	return cimCommitImage(w.handle)
 }
 
 // Close closes the CimFS filesystem.
-func (fs *FileSystem) Close() error {
-	return cimCloseImage(fs.handle)
+func (w *Writer) Close() error {
+	return cimCloseImage(w.handle)
 }
 
 // RemoveFile deletes the file at `path` from the image.
-func (fs *FileSystem) RemoveFile(path string) error {
-	return cimDeletePath(fs.handle, path)
+func (w *Writer) RemoveFile(path string) error {
+	return cimDeletePath(w.handle, path)
 }
 
 // AddLink adds a hard link from `oldPath` to `newPath` in the image.
-func (fs *FileSystem) AddLink(oldPath string, newPath string) error {
-	return cimCreateHardLink(fs.handle, newPath, oldPath)
-}
-
-// MountImage mounts the CimFS image at `path` to the volume `volumeGUID`.
-func MountImage(imagePath string, fsName string, volumeGUID guid.GUID) error {
-	fsName = fsName + ".fs"
-	return cimMountImage(imagePath, fsName, 0, &volumeGUID)
-}
-
-// UnmountImage unmounts the CimFS volume `volumeGUID`.
-func UnmountImage(volumeGUID guid.GUID) error {
-	return cimDismountImage(&volumeGUID)
+func (w *Writer) AddLink(oldPath string, newPath string) error {
+	return cimCreateHardLink(w.handle, newPath, oldPath)
 }

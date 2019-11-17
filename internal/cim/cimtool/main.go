@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"path/filepath"
 
 	"github.com/Microsoft/hcsshim/internal/cim"
 )
@@ -13,7 +12,7 @@ import (
 func main() {
 	err := func() error {
 		p := os.Args[1]
-		c, err := cim.Open(filepath.Dir(p), filepath.Base(p))
+		c, err := cim.Open(p)
 		if err != nil {
 			return err
 		}
