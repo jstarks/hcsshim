@@ -1,4 +1,4 @@
-package cimfs
+package cim
 
 import (
 	"github.com/Microsoft/go-winio/pkg/guid"

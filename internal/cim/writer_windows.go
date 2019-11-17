@@ -1,4 +1,4 @@
-package cimfs
+package cim
 
 import (
 	"os"
@@ -11,7 +11,7 @@ import (
 )
 
 // FileInfo represents the metadata for a single file in the image.
-type FileInfo struct {
+type FileInfoX struct {
 	Size int64
 
 	CreationTime   windows.Filetime
@@ -23,7 +23,7 @@ type FileInfo struct {
 
 	SecurityDescriptor []byte
 	ReparseData        []byte
-	EAs                []winio.ExtendedAttribute
+	ExtendedAttributes []winio.ExtendedAttribute
 }
 
 type fileInfoInternal struct {
@@ -41,8 +41,8 @@ type fileInfoInternal struct {
 	ReparseDataBuffer unsafe.Pointer
 	ReparseDataSize   uint32
 
-	EAs     unsafe.Pointer
-	EACount uint32
+	ExtendedAttributes unsafe.Pointer
+	EACount            uint32
 }
 
 type fsHandle uintptr
@@ -56,7 +56,7 @@ type FileSystem struct {
 }
 
 // Open opens an existing CimFS filesystem, or creates one if it doesn't exist.
-func Open(imagePath string, oldFSName string, newFSName string) (*FileSystem, error) {
+func OpenWriter(imagePath string, oldFSName string, newFSName string) (*FileSystem, error) {
 	if err := os.MkdirAll(imagePath, 0); err != nil {
 		return nil, err
 	}
@@ -85,6 +85,13 @@ func Open(imagePath string, oldFSName string, newFSName string) (*FileSystem, er
 	return &FileSystem{handle: handle}, nil
 }
 
+func (ft Filetime) toWindows() windows.Filetime {
+	return windows.Filetime{
+		LowDateTime:  uint32(ft),
+		HighDateTime: uint32(ft >> 32),
+	}
+}
+
 // AddFile adds an entry for a file to the image. The file is added at the
 // specified path. After calling this function, the file is set as the active
 // stream for the image, so data can be written by calling `Write`.
@@ -92,10 +99,10 @@ func (fs *FileSystem) AddFile(path string, info *FileInfo) error {
 	infoInternal := &fileInfoInternal{
 		Attributes:     info.Attributes,
 		FileSize:       info.Size,
-		CreationTime:   info.CreationTime,
-		LastWriteTime:  info.LastWriteTime,
-		ChangeTime:     info.ChangeTime,
-		LastAccessTime: info.LastAccessTime,
+		CreationTime:   info.CreationTime.toWindows(),
+		LastWriteTime:  info.LastWriteTime.toWindows(),
+		ChangeTime:     info.ChangeTime.toWindows(),
+		LastAccessTime: info.LastAccessTime.toWindows(),
 	}
 
 	if len(info.SecurityDescriptor) > 0 {
@@ -108,13 +115,9 @@ func (fs *FileSystem) AddFile(path string, info *FileInfo) error {
 		infoInternal.ReparseDataSize = uint32(len(info.ReparseData))
 	}
 
-	if len(info.EAs) > 0 {
-		buf, err := winio.EncodeExtendedAttributes(info.EAs)
-		if err != nil {
-			return err
-		}
-		infoInternal.EAs = unsafe.Pointer(&buf[0])
-		infoInternal.EACount = uint32(len(buf))
+	if len(info.ExtendedAttributes) > 0 {
+		infoInternal.ExtendedAttributes = unsafe.Pointer(&info.ExtendedAttributes[0])
+		infoInternal.EACount = uint32(len(info.ExtendedAttributes))
 	}
 
 	return cimCreateFile(fs.handle, path, infoInternal, &fs.activeStream)

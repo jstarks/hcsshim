@@ -436,7 +436,7 @@ type FileInfo struct {
 	CreationTime, LastWriteTime, ChangeTime, LastAccessTime Filetime
 	SecurityDescriptor                                      []byte
 	ExtendedAttributes                                      []byte
-	ReparseBuffer                                           []byte
+	ReparseData                                             []byte
 }
 
 // Windows file attributes.
@@ -521,7 +521,7 @@ func (cr *Reader) stat(ino *inode) (*FileInfo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading reparse buffer at %#x: %s", ino.file.EaOffset, err)
 		}
-		fi.ReparseBuffer = b
+		fi.ReparseData = b
 		attr |= FILE_ATTRIBUTE_REPARSE_POINT
 	}
 	fi.Attributes = attr
