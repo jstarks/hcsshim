@@ -33,20 +33,29 @@ type streamHandle uintptr
 // Writer represents a single CimFS filesystem. On disk, the image is
 // composed of a filesystem file and several object ID and region files.
 type Writer struct {
+	name         string
 	handle       fsHandle
+	activeName   string
 	activeStream streamHandle
 }
 
 func Create(p string) (*Writer, error) {
-	return create(filepath.Dir(p), "", filepath.Base(p))
+	w, err := create(filepath.Dir(p), "", filepath.Base(p))
+	if err != nil {
+		err = &CimError{Cim: p, Op: "create", Err: err}
+	}
+	return w, err
 }
 
-func Append(p string, newfsname string) (*Writer, error) {
-	return create(filepath.Dir(p), filepath.Base(p), newfsname)
+func Append(p string, newFSName string) (*Writer, error) {
+	w, err := create(filepath.Dir(p), filepath.Base(p), newFSName)
+	if err != nil {
+		err = &CimError{Cim: p, Op: "append", Path: newFSName, Err: err}
+	}
+	return w, err
 }
 
-func create(imagePath string, oldFSName string, newFSName string) (*Writer, error) {
-	var err error
+func create(imagePath string, oldFSName string, newFSName string) (_ *Writer, err error) {
 	var oldNameBytes *uint16
 	if oldFSName != "" {
 		oldNameBytes, err = windows.UTF16PtrFromString(oldFSName)
@@ -65,7 +74,7 @@ func create(imagePath string, oldFSName string, newFSName string) (*Writer, erro
 	if err := cimCreateImage(imagePath, oldNameBytes, newNameBytes, &handle); err != nil {
 		return nil, err
 	}
-	return &Writer{handle: handle}, nil
+	return &Writer{handle: handle, name: filepath.Join(imagePath, newFSName)}, nil
 }
 
 func (ft Filetime) toWindows() windows.Filetime {
@@ -87,36 +96,37 @@ func (w *Writer) AddFile(path string, info *FileInfo) error {
 		ChangeTime:     info.ChangeTime.toWindows(),
 		LastAccessTime: info.LastAccessTime.toWindows(),
 	}
-
 	if len(info.SecurityDescriptor) > 0 {
 		infoInternal.SecurityDescriptorBuffer = unsafe.Pointer(&info.SecurityDescriptor[0])
 		infoInternal.SecurityDescriptorSize = uint32(len(info.SecurityDescriptor))
 	}
-
 	if len(info.ReparseData) > 0 {
 		infoInternal.ReparseDataBuffer = unsafe.Pointer(&info.ReparseData[0])
 		infoInternal.ReparseDataSize = uint32(len(info.ReparseData))
 	}
-
 	if len(info.ExtendedAttributes) > 0 {
 		infoInternal.ExtendedAttributes = unsafe.Pointer(&info.ExtendedAttributes[0])
 		infoInternal.EACount = uint32(len(info.ExtendedAttributes))
 	}
-
-	return cimCreateFile(w.handle, path, infoInternal, &w.activeStream)
+	err := cimCreateFile(w.handle, path, infoInternal, &w.activeStream)
+	if err != nil {
+		err = &CimError{Cim: w.name, Op: "CreateFile", Path: path, Err: err}
+	} else {
+		w.activeName = path
+	}
+	return err
 }
 
 // Write writes bytes to the active stream.
 func (w *Writer) Write(p []byte) (int, error) {
 	if w.activeStream == 0 {
-		return 0, errors.New("No active stream")
+		return 0, errors.New("no active stream")
 	}
-
 	err := cimWriteStream(w.activeStream, uintptr(unsafe.Pointer(&p[0])), uint32(len(p)))
 	if err != nil {
+		err = &CimError{Cim: w.name, Op: "write", Path: w.activeName, Err: err}
 		return 0, err
 	}
-
 	return len(p), nil
 }
 
@@ -125,26 +135,51 @@ func (w *Writer) CloseStream() error {
 	if w.activeStream == 0 {
 		return errors.New("No active stream")
 	}
-
-	return cimCloseStream(w.activeStream)
+	err := cimCloseStream(w.activeStream)
+	if err != nil {
+		err = &CimError{Cim: w.name, Op: "CloseStream", Path: w.activeName, Err: err}
+	}
+	w.activeStream = 0
+	w.activeName = ""
+	return err
 }
 
 // TODO do this as part of Close?
 func (w *Writer) Commit() error {
-	return cimCommitImage(w.handle)
+	err := cimCommitImage(w.handle)
+	if err != nil {
+		err = &CimError{Cim: w.name, Op: "Commit", Err: err}
+	}
+	return err
 }
 
 // Close closes the CimFS filesystem.
 func (w *Writer) Close() error {
-	return cimCloseImage(w.handle)
+	if w.handle == 0 {
+		return errors.New("invalid writer")
+	}
+	err := cimCloseImage(w.handle)
+	if err != nil {
+		err = &CimError{Cim: w.name, Op: "close", Err: err}
+	}
+	w.handle = 0
+	return err
 }
 
 // RemoveFile deletes the file at `path` from the image.
 func (w *Writer) RemoveFile(path string) error {
-	return cimDeletePath(w.handle, path)
+	err := cimDeletePath(w.handle, path)
+	if err != nil {
+		err = &CimError{Cim: w.name, Op: "RemoveFile", Err: err}
+	}
+	return err
 }
 
 // AddLink adds a hard link from `oldPath` to `newPath` in the image.
 func (w *Writer) AddLink(oldPath string, newPath string) error {
-	return cimCreateHardLink(w.handle, newPath, oldPath)
+	err := cimCreateHardLink(w.handle, newPath, oldPath)
+	if err != nil {
+		err = &CimError{Cim: w.name, Op: "CreateHardLink", Err: err}
+	}
+	return err
 }

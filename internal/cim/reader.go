@@ -79,8 +79,8 @@ type Stream struct {
 	name  string
 }
 
-// ReaderError is the error type returned by most functions in this package.
-type ReaderError struct {
+// CimError is the error type returned by most functions in this package.
+type CimError struct {
 	Cim    string
 	Op     string
 	Path   string
@@ -88,7 +88,7 @@ type ReaderError struct {
 	Err    error
 }
 
-func (e *ReaderError) Error() string {
+func (e *CimError) Error() string {
 	s := "cim " + e.Op + " " + e.Cim
 	if e.Path != "" {
 		s += ":" + e.Path
@@ -148,7 +148,7 @@ func loadRegionSet(rs *format.RegionSet, imagePath string, reg []region) (int, e
 func Open(p string) (_ *Reader, err error) {
 	defer func() {
 		if err != nil {
-			err = &ReaderError{Cim: p, Op: "open", Err: err}
+			err = &CimError{Cim: p, Op: "open", Err: err}
 		}
 	}()
 	f, err := os.Open(p)
@@ -307,7 +307,7 @@ func (cr *Reader) OpenAt(dirf *File, p string) (_ *File, err error) {
 	fullp := p
 	defer func() {
 		if err != nil {
-			err = &ReaderError{Cim: cr.name, Path: fullp, Op: "openat", Err: err}
+			err = &CimError{Cim: cr.name, Path: fullp, Op: "openat", Err: err}
 		}
 	}()
 	dirOnly := len(p) > 0 && p[len(p)-1] == '/'
@@ -409,18 +409,22 @@ func (cr *Reader) getInode(id format.FileID) (*inode, error) {
 // Filetime is a Windows FILETIME, in 100-ns units since January 1, 1601.
 type Filetime int64
 
+// 100ns units between Windows NT epoch (Jan 1 1601) and Unix epoch (Jan 1 1970)
+const epochDelta = 116444736000000000
+
 // Time returns a Go time equivalent to `ft`.
 func (ft Filetime) Time() time.Time {
 	if ft == 0 {
 		return time.Time{}
 	}
-	// 100-nanosecond intervals since January 1, 1601
-	nsec := int64(ft)
-	// change starting time to the Epoch (00:00:00 UTC, January 1, 1970)
-	nsec -= 116444736000000000
-	// convert into nanoseconds
-	nsec *= 100
-	return time.Unix(0, nsec)
+	return time.Unix(0, (int64(ft)-epochDelta)*100)
+}
+
+func FiletimeFromTime(t time.Time) Filetime {
+	if t.IsZero() {
+		return 0
+	}
+	return Filetime(t.UnixNano()/100 + epochDelta)
 }
 
 func (ft Filetime) String() string {
@@ -532,7 +536,7 @@ func (cr *Reader) stat(ino *inode) (*FileInfo, error) {
 func (f *File) Stat() (*FileInfo, error) {
 	fi, err := f.r.stat(f.ino)
 	if err != nil {
-		err = &ReaderError{Cim: f.r.name, Path: f.name, Op: "stat", Err: err}
+		err = &CimError{Cim: f.r.name, Path: f.name, Op: "stat", Err: err}
 	}
 	return fi, err
 }
@@ -594,7 +598,7 @@ func (cr *Reader) readStream(sr *streamReader, b []byte) (_ int, err error) {
 func (f *File) Read(b []byte) (_ int, err error) {
 	defer func() {
 		if err != nil && err != io.EOF {
-			err = &ReaderError{Cim: f.r.name, Path: f.Name(), Op: "read", Err: err}
+			err = &CimError{Cim: f.r.name, Path: f.Name(), Op: "read", Err: err}
 		}
 	}()
 	if f.IsDir() {
@@ -744,7 +748,7 @@ func (f *File) Name() string {
 func (f *File) Readdir() (_ []string, err error) {
 	defer func() {
 		if err != nil {
-			err = &ReaderError{Cim: f.r.name, Path: f.name, Op: "readdir", Err: err}
+			err = &CimError{Cim: f.r.name, Path: f.name, Op: "readdir", Err: err}
 		}
 	}()
 	if !f.ino.IsDir() {
@@ -793,7 +797,7 @@ func (cr *Reader) getStreamTable(ino *inode) ([]byte, error) {
 func (f *File) Readstreams() (_ []string, err error) {
 	defer func() {
 		if err != nil {
-			err = &ReaderError{Cim: f.r.name, Path: f.name, Op: "readstreams", Err: err}
+			err = &CimError{Cim: f.r.name, Path: f.name, Op: "readstreams", Err: err}
 		}
 	}()
 	table, err := f.r.getStreamTable(f.ino)
@@ -815,7 +819,7 @@ func (f *File) Readstreams() (_ []string, err error) {
 func (f *File) OpenStream(name string) (_ *Stream, err error) {
 	defer func() {
 		if err != nil {
-			err = &ReaderError{Cim: f.r.name, Path: f.name, Stream: name, Op: "openstream", Err: err}
+			err = &CimError{Cim: f.r.name, Path: f.name, Stream: name, Op: "openstream", Err: err}
 		}
 	}()
 	table, err := f.r.getStreamTable(f.ino)
@@ -842,7 +846,7 @@ func (f *File) OpenStream(name string) (_ *Stream, err error) {
 func (s *Stream) Read(b []byte) (int, error) {
 	n, err := s.c.readStream(&s.r, b)
 	if err != nil && err != io.EOF {
-		err = &ReaderError{Cim: s.c.name, Path: s.fname, Stream: s.name, Op: "read", Err: err}
+		err = &CimError{Cim: s.c.name, Path: s.fname, Stream: s.name, Op: "read", Err: err}
 	}
 	return n, err
 }
