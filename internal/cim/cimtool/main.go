@@ -79,13 +79,22 @@ func main() {
 				return err
 			}
 			return cim.Unmount(g)
-		case "create":
-			hp := args[0]
-			w, err := cim.Create(p)
+		case "create", "append":
+			var (
+				w   *cim.Writer
+				err error
+			)
+			if cmd == "append" {
+				w, err = cim.Append(p, args[0])
+				args = args[1:]
+			} else {
+				w, err = cim.Create(p)
+			}
 			if err != nil {
 				return err
 			}
 			defer w.Close()
+			hp := args[0]
 			err = filepath.Walk(hp, func(p string, fi os.FileInfo, err error) error {
 				if err != nil {
 					return err

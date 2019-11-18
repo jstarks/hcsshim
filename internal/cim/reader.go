@@ -481,7 +481,6 @@ type FileInfo struct {
 	FileID             uint64 // ignored on write
 	Size               int64
 	Attributes         uint32
-	ReparseTag         uint32
 	CreationTime       Filetime
 	LastWriteTime      Filetime
 	ChangeTime         Filetime
@@ -559,7 +558,6 @@ func (cr *Reader) stat(ino *inode) (*FileInfo, error) {
 		Attributes:     ino.attributes(),
 		FileID:         uint64(ino.id),
 		Size:           ino.file.DefaultStream.Size(),
-		ReparseTag:     ino.file.ReparseTag,
 		CreationTime:   Filetime(ino.file.CreationTime),
 		LastWriteTime:  Filetime(ino.file.LastWriteTime),
 		ChangeTime:     Filetime(ino.file.ChangeTime),

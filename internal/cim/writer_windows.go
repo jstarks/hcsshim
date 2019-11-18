@@ -84,6 +84,9 @@ func (ft Filetime) toWindows() windows.Filetime {
 	}
 }
 
+// Equivalent to SDDL of "D:NO_ACCESS_CONTROL"
+var nullSd = []byte{1, 0, 4, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+
 // AddFile adds an entry for a file to the image. The file is added at the
 // specified path. After calling this function, the file is set as the active
 // stream for the image, so data can be written by calling `Write`.
@@ -96,10 +99,14 @@ func (w *Writer) AddFile(path string, info *FileInfo) error {
 		ChangeTime:     info.ChangeTime.toWindows(),
 		LastAccessTime: info.LastAccessTime.toWindows(),
 	}
-	if len(info.SecurityDescriptor) > 0 {
-		infoInternal.SecurityDescriptorBuffer = unsafe.Pointer(&info.SecurityDescriptor[0])
-		infoInternal.SecurityDescriptorSize = uint32(len(info.SecurityDescriptor))
+	sd := info.SecurityDescriptor
+	if len(sd) == 0 {
+		// Passing an empty security descriptor creates a CIM in a weird state.
+		// Pass the NULL DACL.
+		sd = nullSd
 	}
+	infoInternal.SecurityDescriptorBuffer = unsafe.Pointer(&sd[0])
+	infoInternal.SecurityDescriptorSize = uint32(len(sd))
 	if len(info.ReparseData) > 0 {
 		infoInternal.ReparseDataBuffer = unsafe.Pointer(&info.ReparseData[0])
 		infoInternal.ReparseDataSize = uint32(len(info.ReparseData))

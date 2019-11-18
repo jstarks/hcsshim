@@ -66,7 +66,7 @@ func decodeWcifs(f *cim.File) (guid.GUID, string, error) {
 	return info.LayerID, string(utf16.Decode(name16)), nil
 }
 
-func encodeWcifs(id guid.GUID, p string) (uint32, []byte) {
+func encodeWcifs(id guid.GUID, p string) []byte {
 	var buf bytes.Buffer
 	p16 := utf16.Encode([]rune(p))
 	info := wciReparseInfo{
@@ -78,7 +78,7 @@ func encodeWcifs(id guid.GUID, p string) (uint32, []byte) {
 	info.Size = uint16(binary.Size(info) - 8 + len(p16)*2)
 	binary.Write(&buf, binary.LittleEndian, &info)
 	binary.Write(&buf, binary.LittleEndian, p16)
-	return reparseTagWci, buf.Bytes()
+	return buf.Bytes()
 }
 
 func findParent(p string, parentID guid.GUID, ls map[guid.GUID]*cim.Reader) (guid.GUID, *cim.File, error) {
@@ -178,7 +178,7 @@ func Expand(p string, expandedFS string, parentID guid.GUID, layers []Layer) err
 						pfcp = pfcp[1:]
 					}
 					pfcp = strings.ReplaceAll(pfcp, "/", `\\`)
-					fi.ReparseTag, fi.ReparseData = encodeWcifs(pid, pfcp)
+					fi.ReparseData = encodeWcifs(pid, pfcp)
 					fi.Attributes |= cim.FILE_ATTRIBUTE_REPARSE_POINT
 					// WCI reparse points are sparse so that they can report the
 					// file's size without having any actual backing data.
