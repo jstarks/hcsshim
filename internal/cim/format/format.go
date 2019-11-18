@@ -185,7 +185,11 @@ func (s *Stream) Size() int64 {
 }
 
 func (s *Stream) Type() StreamType {
-	return StreamType(s.LengthAndType >> 48)
+	return StreamType((s.LengthAndType >> 48) & 0xff)
+}
+
+func (s *Stream) Sparse() bool {
+	return s.LengthAndType&(1<<56) != 0
 }
 
 // PeImage is the stream data for a file that is a PE image. It provides an

@@ -179,7 +179,10 @@ func Expand(p string, expandedFS string, parentID guid.GUID, layers []Layer) err
 					}
 					pfcp = strings.ReplaceAll(pfcp, "/", `\\`)
 					fi.ReparseTag, fi.ReparseData = encodeWcifs(pid, pfcp)
-					fi.Attributes |= cim.FILE_ATTRIBUTE_REPARSE_POINT | cim.FILE_ATTRIBUTE_SPARSE_FILE
+					fi.Attributes |= cim.FILE_ATTRIBUTE_REPARSE_POINT
+					// WCI reparse points are sparse so that they can report the
+					// file's size without having any actual backing data.
+					fi.Attributes |= cim.FILE_ATTRIBUTE_SPARSE_FILE
 				}
 				err = w.AddFile(path.Join(f.Name(), c), fi)
 				if err != nil {

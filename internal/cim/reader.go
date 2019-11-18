@@ -639,6 +639,12 @@ func (cr *Reader) readStream(sr *streamReader, b []byte) (_ int, err error) {
 	if int64(n) > rem {
 		n = int(rem)
 	}
+	if sr.stream.Sparse() {
+		for i := range b[:n] {
+			b[i] = 0
+		}
+		return n, nil
+	}
 	ro := sr.stream.DataOffset
 	off := sr.off
 	if sr.stream.Type() == format.StreamTypePeImage {
