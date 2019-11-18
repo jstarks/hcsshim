@@ -213,6 +213,7 @@ const (
 	FileFlagHidden
 	FileFlagSystem
 	FileFlagArchive
+	FileFlagSparse
 )
 
 // File represents a file in a file system.

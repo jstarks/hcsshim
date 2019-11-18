@@ -1,45 +1,24 @@
 package cim_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Microsoft/hcsshim/internal/cim"
 )
 
-func walk(cr *cim.Reader, f *cim.File, depthLeft int, fn func(*cim.File, *cim.Stream) error) error {
-	err := fn(f, nil)
-	if err != nil {
-		return err
-	}
-	ss, err := f.Readstreams()
-	if err != nil {
-		return err
-	}
-	for _, sn := range ss {
-		s, err := f.OpenStream(sn)
+func walk(cr *cim.Reader, f *cim.File, maxDepth int, fn func(*cim.File, *cim.Stream) error) error {
+	baseDepth := strings.Count(f.Name(), "/")
+	return cim.Walk(f, func(f *cim.File, s *cim.Stream) (bool, error) {
+		err := fn(f, s)
 		if err != nil {
-			return err
+			return false, err
 		}
-		err = fn(f, s)
-		if err != nil {
-			return err
+		if strings.Count(f.Name(), "/") >= baseDepth+maxDepth {
+			return true, cim.SkipDir
 		}
-	}
-	if !f.IsDir() || depthLeft == 0 {
-		return nil
-	}
-	names, err := f.Readdir()
-	if err != nil {
-		return err
-	}
-	for _, name := range names {
-		cf, err := cr.OpenAt(f, name)
-		if err != nil {
-			return err
-		}
-		walk(cr, cf, depthLeft-1, fn)
-	}
-	return nil
+		return true, nil
+	})
 }
 
 func TestCim(t *testing.T) {
@@ -48,7 +27,7 @@ func TestCim(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cr.Close()
-	f, err := cr.OpenAt(nil, "/")
+	f, err := cr.Open("/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,11 +39,7 @@ func TestCim(t *testing.T) {
 			}
 			t.Logf("%s: %+v", f.Name(), fi)
 		} else {
-			si, err := s.Stat()
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Logf("%s:%s: %+v", f.Name(), s.Name(), si)
+			t.Logf("%s:%s: size %d", f.Name(), s.Name(), s.Size())
 		}
 		return nil
 	})
@@ -79,7 +54,7 @@ func TestOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cr.Close()
-	f, err := cr.OpenAt(nil, "Files/Windows")
+	f, err := cr.Open("Files/Windows")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,8 +71,8 @@ func TestOpenMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cr.Close()
-	_, err = cr.OpenAt(nil, "Files/WindowsX")
-	if cerr, ok := err.(*cim.ReaderError); !ok || cerr.Err != cim.ErrFileNotFound {
+	_, err = cr.Open("Files/WindowsX")
+	if cerr, ok := err.(*cim.CimError); !ok || cerr.Err != cim.ErrFileNotFound {
 		t.Fatalf("expected cim error got %s", err)
 	}
 }
@@ -108,7 +83,7 @@ func BenchmarkStat(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer cr.Close()
-	f, err := cr.OpenAt(nil, "Files/Windows/System32")
+	f, err := cr.Open("Files/Windows/System32")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -126,12 +101,12 @@ func BenchmarkOpen(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer cr.Close()
-	f, err := cr.OpenAt(nil, "Files/Windows/System32")
+	f, err := cr.Open("Files/Windows/System32")
 	if err != nil {
 		b.Fatal(err)
 	}
 	for i := 0; i < b.N; i++ {
-		_, err := cr.OpenAt(f, "xmllite.dll")
+		_, err := f.OpenAt("xmllite.dll")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -145,7 +120,7 @@ func BenchmarkOpenAbsolute(b *testing.B) {
 	}
 	defer cr.Close()
 	for i := 0; i < b.N; i++ {
-		_, err := cr.OpenAt(nil, "Files/Windows/System32/xmllite.dll")
+		_, err := cr.Open("Files/Windows/System32/xmllite.dll")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -158,7 +133,7 @@ func BenchmarkWalk(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer cr.Close()
-	f, err := cr.OpenAt(nil, "/")
+	f, err := cr.Open("/")
 	if err != nil {
 		b.Fatal(err)
 	}

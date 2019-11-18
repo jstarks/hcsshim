@@ -108,7 +108,7 @@ func (w *Writer) AddFile(path string, info *FileInfo) error {
 		infoInternal.ExtendedAttributes = unsafe.Pointer(&info.ExtendedAttributes[0])
 		infoInternal.EACount = uint32(len(info.ExtendedAttributes))
 	}
-	err := cimCreateFile(w.handle, path, infoInternal, &w.activeStream)
+	err := cimCreateFile(w.handle, filepath.FromSlash(path), infoInternal, &w.activeStream)
 	if err != nil {
 		err = &CimError{Cim: w.name, Op: "CreateFile", Path: path, Err: err}
 	} else {

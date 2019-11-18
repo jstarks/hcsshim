@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -303,53 +302,99 @@ func (cr *Reader) readBin(v interface{}, o format.RegionOffset, off int64) error
 // OpenAt returns a file associated with path `p`, relative to `dirf`. If `dirf`
 // is nil or `p` starts with '/', then the path will be opened relative to the
 // CIM root.
-func (cr *Reader) OpenAt(dirf *File, p string) (_ *File, err error) {
+func (f *File) OpenAt(p string) (*File, error) {
+	return f.r.openAt(f, p)
+}
+
+func (cr *Reader) Root() *File {
+	return cr.newFile("/", cr.root)
+}
+
+func (cr *Reader) Open(p string) (*File, error) {
+	return cr.Root().OpenAt(p)
+}
+
+func (cr *Reader) newFile(name string, ino *inode) *File {
+	return &File{
+		r:    cr,
+		name: name,
+		ino:  ino,
+		sr:   streamReader{stream: ino.file.DefaultStream},
+	}
+}
+
+func (f *File) WalkPath(p string) (*File, string, error) {
+	ino, walked, err := f.r.walkPath(f.ino, p)
+	if err != nil {
+		return nil, "", err
+	}
+	return f.r.newFile(p[:walked], ino), p[walked:], nil
+}
+
+func (cr *Reader) walkPath(ino *inode, p string) (*inode, int, error) {
+	walked := 0
+	for walked < len(p) {
+		if !ino.IsDir() {
+			break
+		}
+		for n := 0; len(p) > walked+n && p[walked+n] == '/'; n++ {
+		}
+		n := strings.IndexByte(p[walked:], '/')
+		var (
+			name string
+			next int
+		)
+		if n < 0 {
+			name = p[walked:]
+			next = len(p)
+		} else {
+			name = p[walked : walked+n]
+			next = walked + n + 1
+		}
+		if name != "" {
+			fid, err := cr.findChild(ino, name)
+			if err != nil {
+				return nil, 0, err
+			}
+			if fid == 0 {
+				break
+			}
+			ino, err = cr.getInode(fid)
+			if err != nil {
+				return nil, 0, err
+			}
+		}
+		walked = next
+	}
+	return ino, walked, nil
+}
+
+func (cr *Reader) openAt(dirf *File, p string) (_ *File, err error) {
 	fullp := p
+	var ino *inode
+	if len(p) > 0 && p[0] == '/' {
+		ino = cr.root
+	} else {
+		ino = dirf.ino
+		fullp = dirf.name + "/" + fullp
+	}
 	defer func() {
 		if err != nil {
 			err = &CimError{Cim: cr.name, Path: fullp, Op: "openat", Err: err}
 		}
 	}()
-	dirOnly := len(p) > 0 && p[len(p)-1] == '/'
-	p = path.Clean(p)
-	if dirf != nil && !dirf.IsDir() {
-		return nil, ErrNotADirectory
+	ino, walked, err := cr.walkPath(ino, p)
+	if err != nil {
+		return nil, err
 	}
-	var ino *inode
-	if p[0] == '/' {
-		ino = cr.root
-		p = p[1:]
-	} else if dirf == nil {
-		ino = cr.root
-	} else {
-		fullp = path.Join(dirf.name, fullp)
-		if dirOnly {
-			fullp += "/"
-		}
-		ino = dirf.ino
-	}
-	if len(p) > 0 && p != "." {
-		for _, name := range strings.Split(p, "/") {
-			fid, err := cr.findChild(ino, name)
-			if err != nil {
-				return nil, ErrFileNotFound
-			}
-			ino, err = cr.getInode(fid)
-			if err != nil {
-				return nil, err
-			}
+	if walked < len(p) {
+		if ino.IsDir() {
+			return nil, ErrFileNotFound
+		} else {
+			return nil, ErrNotADirectory
 		}
 	}
-	if dirOnly && !ino.IsDir() {
-		return nil, ErrNotADirectory
-	}
-	f := &File{
-		r:    cr,
-		name: fullp,
-		ino:  ino,
-		sr:   streamReader{stream: ino.file.DefaultStream},
-	}
-	return f, nil
+	return cr.newFile(fullp, ino), nil
 }
 
 func (cr *Reader) readFile(id format.FileID, file *format.File) error {
@@ -433,14 +478,17 @@ func (ft Filetime) String() string {
 
 // A FileInfo specifies information about a file.
 type FileInfo struct {
-	FileID                                                  uint64
-	Size                                                    int64
-	Attributes                                              uint32
-	ReparseTag                                              uint32
-	CreationTime, LastWriteTime, ChangeTime, LastAccessTime Filetime
-	SecurityDescriptor                                      []byte
-	ExtendedAttributes                                      []byte
-	ReparseData                                             []byte
+	FileID             uint64 // ignored on write
+	Size               int64
+	Attributes         uint32
+	ReparseTag         uint32
+	CreationTime       Filetime
+	LastWriteTime      Filetime
+	ChangeTime         Filetime
+	LastAccessTime     Filetime
+	SecurityDescriptor []byte
+	ExtendedAttributes []byte
+	ReparseData        []byte
 }
 
 // Windows file attributes.
@@ -450,6 +498,7 @@ const (
 	FILE_ATTRIBUTE_SYSTEM        = 0x00000004
 	FILE_ATTRIBUTE_DIRECTORY     = 0x00000010
 	FILE_ATTRIBUTE_ARCHIVE       = 0x00000020
+	FILE_ATTRIBUTE_SPARSE_FILE   = 0x00000200
 	FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 )
 
@@ -479,16 +528,7 @@ func (cr *Reader) getSd(o format.RegionOffset) ([]byte, error) {
 	return sd, nil
 }
 
-func (cr *Reader) stat(ino *inode) (*FileInfo, error) {
-	fi := &FileInfo{
-		FileID:         uint64(ino.id),
-		Size:           ino.file.DefaultStream.Size(),
-		ReparseTag:     ino.file.ReparseTag,
-		CreationTime:   Filetime(ino.file.CreationTime),
-		LastWriteTime:  Filetime(ino.file.LastWriteTime),
-		ChangeTime:     Filetime(ino.file.ChangeTime),
-		LastAccessTime: Filetime(ino.file.LastAccessTime),
-	}
+func (ino *inode) attributes() uint32 {
 	attr := uint32(0)
 	if ino.file.Flags&format.FileFlagReadOnly != 0 {
 		attr |= FILE_ATTRIBUTE_READONLY
@@ -502,8 +542,28 @@ func (cr *Reader) stat(ino *inode) (*FileInfo, error) {
 	if ino.file.Flags&format.FileFlagArchive != 0 {
 		attr |= FILE_ATTRIBUTE_ARCHIVE
 	}
+	if ino.file.Flags&format.FileFlagSparse != 0 {
+		attr |= FILE_ATTRIBUTE_SPARSE_FILE
+	}
 	if ino.IsDir() {
 		attr |= FILE_ATTRIBUTE_DIRECTORY
+	}
+	if ino.file.ReparseOffset != format.NullOffset {
+		attr |= FILE_ATTRIBUTE_REPARSE_POINT
+	}
+	return attr
+}
+
+func (cr *Reader) stat(ino *inode) (*FileInfo, error) {
+	fi := &FileInfo{
+		Attributes:     ino.attributes(),
+		FileID:         uint64(ino.id),
+		Size:           ino.file.DefaultStream.Size(),
+		ReparseTag:     ino.file.ReparseTag,
+		CreationTime:   Filetime(ino.file.CreationTime),
+		LastWriteTime:  Filetime(ino.file.LastWriteTime),
+		ChangeTime:     Filetime(ino.file.ChangeTime),
+		LastAccessTime: Filetime(ino.file.LastAccessTime),
 	}
 	if ino.file.SdOffset != format.NullOffset {
 		sd, err := cr.getSd(ino.file.SdOffset)
@@ -526,10 +586,16 @@ func (cr *Reader) stat(ino *inode) (*FileInfo, error) {
 			return nil, fmt.Errorf("reading reparse buffer at %#x: %s", ino.file.EaOffset, err)
 		}
 		fi.ReparseData = b
-		attr |= FILE_ATTRIBUTE_REPARSE_POINT
 	}
-	fi.Attributes = attr
 	return fi, nil
+}
+
+func (f *File) Size() int64 {
+	return f.ino.file.DefaultStream.Size()
+}
+
+func (f *File) ReparseTag() uint32 {
+	return f.ino.file.ReparseTag
 }
 
 // Stat returns a FileInfo for the file.
@@ -735,7 +801,7 @@ func (cr *Reader) findChild(ino *inode, name string) (format.FileID, error) {
 			return format.FileID(binary.LittleEndian.Uint32(b)), nil
 		}
 	}
-	return 0, ErrFileNotFound
+	return 0, nil
 }
 
 // Name returns the file's name.
@@ -843,6 +909,54 @@ func (f *File) OpenStream(name string) (_ *Stream, err error) {
 	return nil, ErrFileNotFound
 }
 
+type WalkFunc = func(file *File, stream *Stream) (bool, error)
+
+var SkipDir = errors.New("skip this directory")
+
+func Walk(f *File, fn WalkFunc) error {
+	enumStreams, err := fn(f, nil)
+	skipDir := false
+	if err == SkipDir {
+		skipDir = true
+	} else if err != nil {
+		return err
+	}
+	if enumStreams {
+		ss, err := f.Readstreams()
+		if err != nil {
+			return err
+		}
+		for _, sn := range ss {
+			s, err := f.OpenStream(sn)
+			if err != nil {
+				return err
+			}
+			_, err = fn(f, s)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if !f.IsDir() || skipDir {
+		return nil
+	}
+	names, err := f.Readdir()
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		cf, err := f.OpenAt(name)
+		if err != nil {
+			return err
+		}
+		err = Walk(cf, fn)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Stream) Read(b []byte) (int, error) {
 	n, err := s.c.readStream(&s.r, b)
 	if err != nil && err != io.EOF {
@@ -851,16 +965,9 @@ func (s *Stream) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// A StreamInfo describes a stream.
-type StreamInfo struct {
-	Size int64
-}
-
-// Stat returns information about the stream.
-func (s *Stream) Stat() (*StreamInfo, error) {
-	return &StreamInfo{
-		Size: s.r.stream.Size(),
-	}, nil
+// Size returns the stream's length in bytes.
+func (s *Stream) Size() int64 {
+	return s.r.stream.Size()
 }
 
 // Name returns the name of the stream.

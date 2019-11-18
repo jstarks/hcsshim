@@ -9,6 +9,7 @@ import (
 
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/Microsoft/hcsshim/internal/cim"
+	"github.com/Microsoft/hcsshim/internal/cim/layer"
 )
 
 func main() {
@@ -25,7 +26,7 @@ func main() {
 			}
 			defer c.Close()
 			cp := args[0]
-			f, err := c.OpenAt(nil, cp)
+			f, err := c.Open(cp)
 			if err != nil {
 				return err
 			}
@@ -79,7 +80,7 @@ func main() {
 			}
 			return cim.Unmount(g)
 		case "create":
-			hp := os.Args[3]
+			hp := args[0]
 			w, err := cim.Create(p)
 			if err != nil {
 				return err
@@ -99,6 +100,9 @@ func main() {
 				rp, err := filepath.Rel(hp, p)
 				if err != nil {
 					return err
+				}
+				if rp == "." {
+					rp = ""
 				}
 				err = w.AddFile(filepath.FromSlash(rp), cfi)
 				if err != nil {
@@ -133,6 +137,12 @@ func main() {
 			if err != nil {
 				return err
 			}
+		case "layer":
+			var layers []layer.Layer
+			for i, lp := range args[1:] {
+				layers = append(layers, layer.Layer{ID: guid.GUID{Data1: uint32(i)}, Path: lp})
+			}
+			return layer.Expand(p, args[0], layers[len(layers)-1].ID, layers)
 		default:
 			return fmt.Errorf("unknown command %s", cmd)
 		}
