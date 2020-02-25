@@ -78,8 +78,34 @@ type Stream struct {
 	name  string
 }
 
-// CimError is the error type returned by most functions in this package.
-type CimError struct {
+type OpError struct {
+	Cim string
+	Op  string
+	Err error
+}
+
+func (e *OpError) Error() string {
+	s := "cim " + e.Op + " " + e.Cim
+	s += ": " + e.Err.Error()
+	return s
+}
+
+// PathError is the error type returned by most functions in this package.
+type PathError struct {
+	Cim  string
+	Op   string
+	Path string
+	Err  error
+}
+
+func (e *PathError) Error() string {
+	s := "cim " + e.Op + " " + e.Cim
+	s += ":" + e.Path
+	s += ": " + e.Err.Error()
+	return s
+}
+
+type StreamError struct {
 	Cim    string
 	Op     string
 	Path   string
@@ -87,14 +113,10 @@ type CimError struct {
 	Err    error
 }
 
-func (e *CimError) Error() string {
+func (e *StreamError) Error() string {
 	s := "cim " + e.Op + " " + e.Cim
-	if e.Path != "" {
-		s += ":" + e.Path
-		if e.Stream != "" {
-			s += ":" + e.Stream
-		}
-	}
+	s += ":" + e.Path
+	s += ":" + e.Stream
 	s += ": " + e.Err.Error()
 	return s
 }
@@ -147,7 +169,7 @@ func loadRegionSet(rs *format.RegionSet, imagePath string, reg []region) (int, e
 func Open(p string) (_ *Reader, err error) {
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: p, Op: "open", Err: err}
+			err = &OpError{Cim: p, Op: "open", Err: err}
 		}
 	}()
 	f, err := os.Open(p)
@@ -380,7 +402,7 @@ func (cr *Reader) openAt(dirf *File, p string) (_ *File, err error) {
 	}
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: cr.name, Path: fullp, Op: "openat", Err: err}
+			err = &PathError{Cim: cr.name, Path: fullp, Op: "openat", Err: err}
 		}
 	}()
 	ino, walked, err := cr.walkPath(ino, p)
@@ -600,7 +622,7 @@ func (f *File) ReparseTag() uint32 {
 func (f *File) Stat() (*FileInfo, error) {
 	fi, err := f.r.stat(f.ino)
 	if err != nil {
-		err = &CimError{Cim: f.r.name, Path: f.name, Op: "stat", Err: err}
+		err = &PathError{Cim: f.r.name, Path: f.name, Op: "stat", Err: err}
 	}
 	return fi, err
 }
@@ -668,7 +690,7 @@ func (cr *Reader) readStream(sr *streamReader, b []byte) (_ int, err error) {
 func (f *File) Read(b []byte) (_ int, err error) {
 	defer func() {
 		if err != nil && err != io.EOF {
-			err = &CimError{Cim: f.r.name, Path: f.Name(), Op: "read", Err: err}
+			err = &PathError{Cim: f.r.name, Path: f.Name(), Op: "read", Err: err}
 		}
 	}()
 	if f.IsDir() {
@@ -818,7 +840,7 @@ func (f *File) Name() string {
 func (f *File) Readdir() (_ []string, err error) {
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: f.r.name, Path: f.name, Op: "readdir", Err: err}
+			err = &PathError{Cim: f.r.name, Path: f.name, Op: "readdir", Err: err}
 		}
 	}()
 	if !f.ino.IsDir() {
@@ -867,7 +889,7 @@ func (cr *Reader) getStreamTable(ino *inode) ([]byte, error) {
 func (f *File) Readstreams() (_ []string, err error) {
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: f.r.name, Path: f.name, Op: "readstreams", Err: err}
+			err = &PathError{Cim: f.r.name, Path: f.name, Op: "readstreams", Err: err}
 		}
 	}()
 	table, err := f.r.getStreamTable(f.ino)
@@ -889,7 +911,7 @@ func (f *File) Readstreams() (_ []string, err error) {
 func (f *File) OpenStream(name string) (_ *Stream, err error) {
 	defer func() {
 		if err != nil {
-			err = &CimError{Cim: f.r.name, Path: f.name, Stream: name, Op: "openstream", Err: err}
+			err = &StreamError{Cim: f.r.name, Path: f.name, Stream: name, Op: "openstream", Err: err}
 		}
 	}()
 	table, err := f.r.getStreamTable(f.ino)
@@ -964,7 +986,7 @@ func Walk(f *File, fn WalkFunc) error {
 func (s *Stream) Read(b []byte) (int, error) {
 	n, err := s.c.readStream(&s.r, b)
 	if err != nil && err != io.EOF {
-		err = &CimError{Cim: s.c.name, Path: s.fname, Stream: s.name, Op: "read", Err: err}
+		err = &StreamError{Cim: s.c.name, Path: s.fname, Stream: s.name, Op: "read", Err: err}
 	}
 	return n, err
 }

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"strings"
 	"unicode/utf16"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
@@ -34,26 +33,22 @@ type wciReparseInfo struct {
 }
 
 func isNotFound(err error) bool {
-	cerr, ok := err.(*cim.CimError)
-	return ok && cerr.Err == cim.ErrFileNotFound
+	perr, ok := err.(*cim.PathError)
+	return ok && perr.Err == cim.ErrFileNotFound
 }
 
-func decodeWcifs(f *cim.File) (guid.GUID, string, error) {
-	fi, err := f.Stat()
-	if err != nil {
-		return guid.GUID{}, "", err
-	}
-	b := bytes.NewReader(fi.ReparseData)
+func decodeWci(reparseData []byte) (guid.GUID, string, error) {
+	b := bytes.NewReader(reparseData)
 	var info wciReparseInfo
-	err = binary.Read(b, binary.LittleEndian, &info)
+	err := binary.Read(b, binary.LittleEndian, &info)
 	if err != nil {
 		return guid.GUID{}, "", fmt.Errorf("reading WCI reparse info: %s", err)
 	}
 	if info.Tag != reparseTagWci {
 		return guid.GUID{}, "", fmt.Errorf("wrong reparse tag 0x%x", info.Tag)
 	}
-	if int(info.Size) > len(fi.ReparseData) {
-		return guid.GUID{}, "", fmt.Errorf("invalid reparse length %d > %d", info.Size, len(fi.ReparseData))
+	if int(info.Size) > len(reparseData) {
+		return guid.GUID{}, "", fmt.Errorf("invalid reparse length %d > %d", info.Size, len(reparseData))
 	}
 	if info.Version != 1 {
 		return guid.GUID{}, "", fmt.Errorf("unsupported wcifs version %d", info.Version)
@@ -63,12 +58,25 @@ func decodeWcifs(f *cim.File) (guid.GUID, string, error) {
 	if err != nil {
 		return guid.GUID{}, "", fmt.Errorf("reading WCI reparse name: %s", err)
 	}
+	for i := range name16 {
+		if name16[i] == '\\' {
+			name16[i] = '/'
+		}
+	}
 	return info.LayerID, string(utf16.Decode(name16)), nil
 }
 
-func encodeWcifs(id guid.GUID, p string) []byte {
+func encodeWci(id guid.GUID, p string) []byte {
 	var buf bytes.Buffer
+	for len(p) > 0 && p[0] == '/' {
+		p = p[1:]
+	}
 	p16 := utf16.Encode([]rune(p))
+	for i := range p16 {
+		if p16[i] == '/' {
+			p16[i] = '\\'
+		}
+	}
 	info := wciReparseInfo{
 		Tag:        reparseTagWci,
 		Version:    1,
@@ -81,14 +89,14 @@ func encodeWcifs(id guid.GUID, p string) []byte {
 	return buf.Bytes()
 }
 
-func findParent(p string, parentID guid.GUID, ls map[guid.GUID]*cim.Reader) (guid.GUID, *cim.File, error) {
+func findParent(p string, parentID guid.GUID, ls map[guid.GUID]*cim.File) (guid.GUID, *cim.File, error) {
 	id := parentID
 	for i := 0; i < len(ls); i++ {
 		l, ok := ls[id]
 		if !ok {
 			return id, nil, errors.New("invalid layer ID")
 		}
-		f, rem, err := l.Root().WalkPath(p)
+		f, rem, err := l.WalkPath(p)
 		if err != nil {
 			return id, nil, err
 		}
@@ -102,42 +110,46 @@ func findParent(p string, parentID guid.GUID, ls map[guid.GUID]*cim.Reader) (gui
 				return id, nil, nil
 			}
 		}
-		nextID, tp, err := decodeWcifs(f)
+		fi, err := f.Stat()
 		if err != nil {
 			return id, nil, err
 		}
-		p = strings.ReplaceAll(tp, "\\", "/") + "/" + rem
+		nextID, tp, err := decodeWci(fi.ReparseData)
+		if err != nil {
+			return id, nil, err
+		}
+		p = tp + "/" + rem
 		id = nextID
 	}
 	return id, nil, errors.New("layer loop")
 }
 
-func Expand(p string, expandedFS string, parentID guid.GUID, layers []Layer) error {
+func Expand(w *cim.Writer, p string, prefix string, parentID guid.GUID, layers []Layer) error {
 	r, err := cim.Open(p)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-	ls := make(map[guid.GUID]*cim.Reader)
+	f, err := r.Open(prefix)
+	if err != nil {
+		return err
+	}
+	ls := make(map[guid.GUID]*cim.File)
 	for _, l := range layers {
 		lr, err := cim.Open(l.Path)
 		if err != nil {
 			return err
 		}
 		defer lr.Close()
-		ls[l.ID] = lr
+		f, err := lr.Open(prefix)
+		if err != nil {
+			return err
+		}
+		ls[l.ID] = f
 	}
-	if _, ok := ls[parentID]; !ok {
-		return errors.New("parent layer does not exist")
-	}
-	w, err := cim.Append(p, expandedFS)
-	if err != nil {
-		return err
-	}
-	defer w.Close()
-	err = cim.Walk(r.Root(), func(f *cim.File, _ *cim.Stream) (bool, error) {
+	err = cim.Walk(f, func(f *cim.File, _ *cim.Stream) (bool, error) {
 		if f.ReparseTag() == reparseTagWciTombstone {
-			err := w.RemoveFile(f.Name())
+			err := w.Unlink(f.Name())
 			if err != nil {
 				return false, err
 			}
@@ -172,23 +184,15 @@ func Expand(p string, expandedFS string, parentID guid.GUID, layers []Layer) err
 				if err != nil {
 					return false, err
 				}
+				// Convert ordinary files and directories to WCI reparse points.
 				if len(fi.ReparseData) == 0 {
-					pfcp := pfc.Name()
-					for len(pfcp) > 0 && pfcp[0] == '/' {
-						pfcp = pfcp[1:]
-					}
-					pfcp = strings.ReplaceAll(pfcp, "/", `\\`)
-					fi.ReparseData = encodeWcifs(pid, pfcp)
+					fi.ReparseData = encodeWci(pid, pfc.Name())
 					fi.Attributes |= cim.FILE_ATTRIBUTE_REPARSE_POINT
 					// WCI reparse points are sparse so that they can report the
 					// file's size without having any actual backing data.
 					fi.Attributes |= cim.FILE_ATTRIBUTE_SPARSE_FILE
 				}
-				err = w.AddFile(path.Join(f.Name(), c), fi)
-				if err != nil {
-					return false, err
-				}
-				err = w.CloseStream()
+				err = w.WriteFile(path.Join(f.Name(), c), fi)
 				if err != nil {
 					return false, err
 				}
@@ -200,5 +204,5 @@ func Expand(p string, expandedFS string, parentID guid.GUID, layers []Layer) err
 	if err != nil {
 		return err
 	}
-	return w.Commit()
+	return nil
 }

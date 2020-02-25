@@ -25,6 +25,8 @@ container images.`
 
 var driverInfo = hcsshim.DriverInfo{}
 
+var useCim bool
+
 func main() {
 	app := cli.NewApp()
 	app.Name = "wclayer"
@@ -35,6 +37,13 @@ func main() {
 		mountCommand,
 		removeCommand,
 		unmountCommand,
+	}
+	app.Flags = []cli.Flag{
+		cli.BoolFlag{
+			Name:        "cim",
+			Usage:       "manipulate CIM layers",
+			Destination: &useCim,
+		},
 	}
 	app.Usage = usage
 

@@ -113,11 +113,10 @@ func main() {
 				if rp == "." {
 					rp = ""
 				}
-				err = w.AddFile(filepath.FromSlash(rp), cfi)
+				err = w.WriteFile(rp, cfi)
 				if err != nil {
 					return err
 				}
-				defer w.CloseStream()
 				if !fi.IsDir() {
 					f, err := os.Open(p)
 					if err != nil {
@@ -128,10 +127,6 @@ func main() {
 					if err != nil {
 						return err
 					}
-				}
-				err = w.CloseStream()
-				if err != nil {
-					return err
 				}
 				return nil
 			})
@@ -151,7 +146,19 @@ func main() {
 			for i, lp := range args[1:] {
 				layers = append(layers, layer.Layer{ID: guid.GUID{Data1: uint32(i)}, Path: lp})
 			}
-			return layer.Expand(p, args[0], layers[len(layers)-1].ID, layers)
+			w, err := cim.Append(p, args[0])
+			if err != nil {
+				return err
+			}
+			defer w.Close()
+			err = layer.Expand(w, p, "", layers[len(layers)-1].ID, layers)
+			if err != nil {
+				return err
+			}
+			err = w.Commit()
+			if err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("unknown command %s", cmd)
 		}

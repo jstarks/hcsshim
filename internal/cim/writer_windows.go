@@ -37,12 +37,13 @@ type Writer struct {
 	handle       fsHandle
 	activeName   string
 	activeStream streamHandle
+	activeLeft   int64
 }
 
 func Create(p string) (*Writer, error) {
 	w, err := create(filepath.Dir(p), "", filepath.Base(p))
 	if err != nil {
-		err = &CimError{Cim: p, Op: "create", Err: err}
+		err = &OpError{Cim: p, Op: "Create", Err: err}
 	}
 	return w, err
 }
@@ -50,7 +51,7 @@ func Create(p string) (*Writer, error) {
 func Append(p string, newFSName string) (*Writer, error) {
 	w, err := create(filepath.Dir(p), filepath.Base(p), newFSName)
 	if err != nil {
-		err = &CimError{Cim: p, Op: "append", Path: newFSName, Err: err}
+		err = &PathError{Cim: p, Op: "Append", Path: newFSName, Err: err}
 	}
 	return w, err
 }
@@ -84,13 +85,25 @@ func (ft Filetime) toWindows() windows.Filetime {
 	}
 }
 
+func toNtPath(p string) string {
+	p = filepath.FromSlash(p)
+	for len(p) > 0 && p[0] == filepath.Separator {
+		p = p[1:]
+	}
+	return p
+}
+
 // Equivalent to SDDL of "D:NO_ACCESS_CONTROL"
 var nullSd = []byte{1, 0, 4, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 
-// AddFile adds an entry for a file to the image. The file is added at the
+// WriteFile adds an entry for a file to the image. The file is added at the
 // specified path. After calling this function, the file is set as the active
 // stream for the image, so data can be written by calling `Write`.
-func (w *Writer) AddFile(path string, info *FileInfo) error {
+func (w *Writer) WriteFile(path string, info *FileInfo) error {
+	err := w.closeStream()
+	if err != nil {
+		return err
+	}
 	infoInternal := &fileInfoInternal{
 		Attributes:     info.Attributes,
 		FileSize:       info.Size,
@@ -115,17 +128,15 @@ func (w *Writer) AddFile(path string, info *FileInfo) error {
 		infoInternal.ExtendedAttributes = unsafe.Pointer(&info.ExtendedAttributes[0])
 		infoInternal.EACount = uint32(len(info.ExtendedAttributes))
 	}
-	p := filepath.FromSlash(path)
-	for len(p) > 0 && p[0] == filepath.Separator {
-		p = p[1:]
-	}
-	err := cimCreateFile(w.handle, p, infoInternal, &w.activeStream)
+	err = cimCreateFile(w.handle, toNtPath(path), infoInternal, &w.activeStream)
 	if err != nil {
-		err = &CimError{Cim: w.name, Op: "CreateFile", Path: path, Err: err}
-	} else {
-		w.activeName = path
+		return &PathError{Cim: w.name, Op: "WriteFile", Path: path, Err: err}
 	}
-	return err
+	w.activeName = path
+	if info.Attributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_SPARSE_FILE) == 0 {
+		w.activeLeft = info.Size
+	}
+	return nil
 }
 
 // Write writes bytes to the active stream.
@@ -133,23 +144,33 @@ func (w *Writer) Write(p []byte) (int, error) {
 	if w.activeStream == 0 {
 		return 0, errors.New("no active stream")
 	}
+	if int64(len(p)) > w.activeLeft {
+		return 0, &PathError{Cim: w.name, Op: "Write", Path: w.activeName, Err: errors.New("wrote too much")}
+	}
 	err := cimWriteStream(w.activeStream, uintptr(unsafe.Pointer(&p[0])), uint32(len(p)))
 	if err != nil {
-		err = &CimError{Cim: w.name, Op: "write", Path: w.activeName, Err: err}
+		err = &PathError{Cim: w.name, Op: "Write", Path: w.activeName, Err: err}
 		return 0, err
 	}
+	w.activeLeft -= int64(len(p))
 	return len(p), nil
 }
 
-// CloseStream closes the active stream.
-func (w *Writer) CloseStream() error {
+func (w *Writer) closeStream() error {
 	if w.activeStream == 0 {
-		return errors.New("No active stream")
+		return nil
 	}
 	err := cimCloseStream(w.activeStream)
-	if err != nil {
-		err = &CimError{Cim: w.name, Op: "CloseStream", Path: w.activeName, Err: err}
+	if err == nil && w.activeLeft > 0 {
+		// Validate here because CimCloseStream does not and this improves error
+		// reporting. Otherwise the error will occur in the context of
+		// cimWriteStream.
+		err = errors.New("write truncated")
 	}
+	if err != nil {
+		err = &PathError{Cim: w.name, Op: "closeStream", Path: w.activeName, Err: err}
+	}
+	w.activeLeft = 0
 	w.activeStream = 0
 	w.activeName = ""
 	return err
@@ -157,9 +178,13 @@ func (w *Writer) CloseStream() error {
 
 // TODO do this as part of Close?
 func (w *Writer) Commit() error {
-	err := cimCommitImage(w.handle)
+	err := w.closeStream()
 	if err != nil {
-		err = &CimError{Cim: w.name, Op: "Commit", Err: err}
+		return err
+	}
+	err = cimCommitImage(w.handle)
+	if err != nil {
+		err = &OpError{Cim: w.name, Op: "Commit", Err: err}
 	}
 	return err
 }
@@ -169,28 +194,45 @@ func (w *Writer) Close() error {
 	if w.handle == 0 {
 		return errors.New("invalid writer")
 	}
+	w.closeStream()
 	err := cimCloseImage(w.handle)
 	if err != nil {
-		err = &CimError{Cim: w.name, Op: "close", Err: err}
+		err = &OpError{Cim: w.name, Op: "Close", Err: err}
 	}
 	w.handle = 0
 	return err
 }
 
-// RemoveFile deletes the file at `path` from the image.
-func (w *Writer) RemoveFile(path string) error {
+// Unlink deletes the file at `path` from the image.
+func (w *Writer) Unlink(path string) error {
 	err := cimDeletePath(w.handle, path)
 	if err != nil {
-		err = &CimError{Cim: w.name, Op: "RemoveFile", Err: err}
+		err = &PathError{Cim: w.name, Op: "Unlink", Path: path, Err: err}
 	}
 	return err
 }
 
-// AddLink adds a hard link from `oldPath` to `newPath` in the image.
-func (w *Writer) AddLink(oldPath string, newPath string) error {
-	err := cimCreateHardLink(w.handle, newPath, oldPath)
+type LinkError struct {
+	Cim string
+	Op  string
+	Old string
+	New string
+	Err error
+}
+
+func (e *LinkError) Error() string {
+	return "cim " + e.Op + " " + e.Old + " " + e.New + ": " + e.Err.Error()
+}
+
+// Link adds a hard link from `oldPath` to `newPath` in the image.
+func (w *Writer) Link(oldPath string, newPath string) error {
+	err := w.closeStream()
 	if err != nil {
-		err = &CimError{Cim: w.name, Op: "CreateHardLink", Err: err}
+		return err
+	}
+	err = cimCreateHardLink(w.handle, toNtPath(newPath), toNtPath(oldPath))
+	if err != nil {
+		err = &LinkError{Cim: w.name, Op: "Link", Old: oldPath, New: newPath, Err: err}
 	}
 	return err
 }

@@ -52,11 +52,15 @@ var importCommand = cli.Command{
 		if err != nil {
 			return err
 		}
-		err = winio.EnableProcessPrivileges([]string{winio.SeBackupPrivilege, winio.SeRestorePrivilege})
-		if err != nil {
-			return err
+		if useCim {
+			_, err = ociwclayer.ImportCimLayer(r, path, layers)
+		} else {
+			err = winio.EnableProcessPrivileges([]string{winio.SeBackupPrivilege, winio.SeRestorePrivilege})
+			if err != nil {
+				return err
+			}
+			_, err = ociwclayer.ImportLayer(r, path, layers)
 		}
-		_, err = ociwclayer.ImportLayer(r, path, layers)
 		return err
 	},
 }
